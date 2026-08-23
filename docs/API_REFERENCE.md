@@ -24,6 +24,11 @@ The API is a local operator surface, not a multi-user internet service.
 - Default port: `3333`
 - Override port with `T3MP3ST_PORT`
 - Override bind host with `T3MP3ST_HOST`
+- An explicit non-loopback `T3MP3ST_HOST` **requires** `T3MP3ST_TOKEN`: the server refuses to
+  start without it, and every `/api` request must then send `Authorization: Bearer <token>`
+  (`/api/health` stays open for liveness probes)
+- A client-supplied local-LLM `baseUrl` is restricted to loopback / RFC1918 / ULA / LAN hostnames;
+  link-local (cloud metadata) and public literal IPs need `T3MP3ST_LOCAL_BASE_URL_ALLOWLIST`
 - State-changing requests are guarded against foreign browser origins
 - Loopback binds reject non-loopback Host headers to reduce DNS-rebinding risk
 - Active or networked tool use should have a scope/authorization receipt

@@ -15,7 +15,7 @@ import { execFile, spawn } from 'child_process';
 import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { config, AVAILABLE_MODELS } from './config/index.js';
 import { resolveModels } from './config/provider-models.js';
 import { initProxyFromConfig, configureProxy, getProxyStatus, checkIp, invalidateIpCache } from './net/proxy.js';
@@ -155,6 +155,16 @@ const HOST = process.env.T3MP3ST_HOST || (process.env.DOCKER === 'true' ? '0.0.0
 // non-loopback address) they've opted into network access behind their own front,
 // so we don't second-guess the Host there.
 const HOST_IS_LOOPBACK = /^(127\.|localhost$|::1$|\[::1\]$)/i.test(HOST.trim());
+// SECURITY: an EXPLICIT non-loopback T3MP3ST_HOST puts this command-executing API on
+// the network, where the Origin/Host guards' localhost threat model no longer holds.
+// That mode REQUIRES Bearer auth: set T3MP3ST_TOKEN and every /api request must
+// present `Authorization: Bearer <token>`; without a token the server REFUSES TO
+// START (see startServer) rather than listen unauthenticated. The DOCKER=true
+// default 0.0.0.0 bind is exempt — the shipped docker-compose publishes the port on
+// 127.0.0.1 only, so it stays inside the localhost threat model.
+const EXPLICIT_NON_LOOPBACK_HOST = Boolean(process.env.T3MP3ST_HOST?.trim()) && !HOST_IS_LOOPBACK;
+const API_BEARER_TOKEN = process.env.T3MP3ST_TOKEN?.trim() || '';
+
 
 const app = express();
 
@@ -278,6 +288,31 @@ if (HOST_IS_LOOPBACK) {
   });
 }
 
+// --- Bearer auth for an explicitly exposed (non-loopback) bind ----------------
+// Active ONLY when the operator set T3MP3ST_HOST to a non-loopback address AND
+// configured T3MP3ST_TOKEN (startup refuses the bind otherwise). Every /api route
+// then requires `Authorization: Bearer <token>`; /api/health stays open so
+// unauthenticated liveness probes (docker healthcheck, load balancer) still work.
+// The comparison is length-checked + timing-safe so the token can't be probed
+// byte-by-byte over the network.
+if (EXPLICIT_NON_LOOPBACK_HOST && API_BEARER_TOKEN) {
+  const expected = Buffer.from(API_BEARER_TOKEN, 'utf8');
+  app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+    if (req.path === '/health') return next();
+    const header = req.get('authorization') || '';
+    const presented = /^Bearer\s+(.+)$/i.exec(header.trim())?.[1] ?? '';
+    const candidate = Buffer.from(presented, 'utf8');
+    if (candidate.length !== expected.length || !timingSafeEqual(candidate, expected)) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        detail: 'This server is bound to a non-loopback host and requires Authorization: Bearer <T3MP3ST_TOKEN>.',
+      });
+      return;
+    }
+    next();
+  });
+}
+
 app.use(express.json({ limit: '10mb' }));
 
 // Request logging
@@ -319,11 +354,57 @@ function getTempestCommand(): TempestCommand | null {
   return tempestCommand;
 }
 
-// Validate a client-supplied LOCAL model base URL. Any host:port is allowed — the
-// feature exists to reach the operator's OWN local/LAN model server (llama.cpp / Ollama),
-// and the loopback bind + origin guard already restrict callers to the local operator —
-// so only the URL shape + scheme are enforced, blocking gopher:/file:/etc. Returns
-// { value } where value is the trimmed URL, or null when nothing was supplied.
+// Validate a client-supplied LOCAL model base URL. The feature exists to reach the
+// operator's OWN local/LAN model server (llama.cpp / Ollama), so destinations are
+// restricted to loopback, RFC1918/ULA private space, and non-literal hostnames
+// (LAN/DNS names such as "ollama" or "models.internal" — these can't be vetted
+// syntactically and are trusted as operator-supplied names). Literal IPs outside
+// those ranges — including link-local cloud-metadata addresses (169.254.169.254,
+// fe80::/10), CGNAT, and public IPs — are REJECTED unless the operator explicitly
+// allowlists the host via T3MP3ST_LOCAL_BASE_URL_ALLOWLIST (comma-separated
+// hostnames/IPs). This closes the SSRF vector where a request points the server's
+// outbound LLM fetch at cloud instance metadata or arbitrary internet endpoints.
+// URL credentials (user:pass@host) are rejected outright. gopher:/file:/etc. stay
+// blocked by the scheme check. Returns { value } where value is the trimmed URL,
+// or null when nothing was supplied.
+const LOCAL_BASE_URL_ALLOWLIST = new Set(
+  (process.env.T3MP3ST_LOCAL_BASE_URL_ALLOWLIST || '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean),
+);
+// Well-known cloud instance-metadata hostnames that resolve INTO link-local space;
+// a syntactic check can't catch them via DNS, so they are named explicitly.
+const BLOCKED_METADATA_HOSTNAMES = new Set([
+  'metadata.google.internal',
+  'metadata.goog',
+  'metadata.azure.com',
+  'instance-data',
+  '169.254.169.254',
+]);
+function isPrivateOrLoopbackIPv4(host: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a > 255 || b > 255 || Number(m[3]) > 255 || Number(m[4]) > 255) return false;
+  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+function isAllowedLocalBaseUrlHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (LOCAL_BASE_URL_ALLOWLIST.has(host)) return true;
+  if (BLOCKED_METADATA_HOSTNAMES.has(host)) return false;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '::1') return true;
+  if (host.includes(':')) {
+    // IPv6 literal: allow ULA (fc00::/7, i.e. LAN-analog private space); reject
+    // link-local (fe80::/10 — cloud metadata over IPv6), unspecified, and globals.
+    return host.startsWith('fc') || host.startsWith('fd');
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return isPrivateOrLoopbackIPv4(host);
+  // Non-literal hostname (LAN/DNS name) — allowed; see the function comment.
+  return true;
+}
 function sanitizeLocalBaseUrl(raw: unknown): { ok: true; value: string | null } | { ok: false; error: string } {
   if (typeof raw !== 'string' || !raw.trim()) return { ok: true, value: null };
   const v = raw.trim();
@@ -331,6 +412,15 @@ function sanitizeLocalBaseUrl(raw: unknown): { ok: true; value: string | null } 
   try { parsed = new URL(v); } catch { return { ok: false, error: 'Invalid baseUrl' }; }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
     return { ok: false, error: 'baseUrl must be http(s)' };
+  }
+  if (parsed.username || parsed.password) {
+    return { ok: false, error: 'baseUrl must not embed credentials (user:pass@host)' };
+  }
+  if (!parsed.hostname || !isAllowedLocalBaseUrlHost(parsed.hostname)) {
+    return {
+      ok: false,
+      error: 'baseUrl host must be loopback or private/LAN (127.0.0.0/8, ::1, 10/8, 172.16/12, 192.168/16, fc00::/7, or a LAN hostname). Link-local/metadata and public IPs require T3MP3ST_LOCAL_BASE_URL_ALLOWLIST.',
+    };
   }
   return { ok: true, value: v };
 }
@@ -6170,7 +6260,12 @@ app.post('/api/models', async (req: Request, res: Response): Promise<void> => {
   // never responds), so swallow it and fall through to the static list — the route must always answer.
   let cfg: { baseUrl?: string; apiKey?: string } = {};
   try { cfg = config.getLLMConfig(provider); } catch { /* provider has no remote/server config → static fallback */ }
-  const bodyBaseUrl = typeof body.baseUrl === 'string' && body.baseUrl.trim() ? body.baseUrl : undefined;
+  // A caller-supplied baseUrl is an outbound-fetch destination: run it through the
+  // same loopback/private/LAN restriction as the local-LLM proxy (SSRF guard).
+  const rawBodyBaseUrl = typeof body.baseUrl === 'string' && body.baseUrl.trim() ? body.baseUrl : undefined;
+  const buCheck = sanitizeLocalBaseUrl(rawBodyBaseUrl);
+  if (!buCheck.ok) { res.status(400).json({ error: buCheck.error }); return; }
+  const bodyBaseUrl = buCheck.value ?? undefined;
   const bodyKey = typeof body.apiKey === 'string' && body.apiKey ? body.apiKey : undefined;
   // Bind key+baseUrl by source: a caller-supplied custom baseUrl must bring its OWN key — never lend
   // the server's configured apiKey to a body-chosen URL (that would disclose the stored key). The
@@ -8016,15 +8111,35 @@ async function startServer() {
   process.once('SIGTERM', flushAndExit);
   process.once('SIGINT', flushAndExit);
 
+  // SECURITY: refuse to bind an explicitly non-loopback T3MP3ST_HOST without
+  // T3MP3ST_TOKEN. A warning alone has repeatedly proven insufficient for an API
+  // that executes commands; fail closed instead.
+  if (EXPLICIT_NON_LOOPBACK_HOST && !API_BEARER_TOKEN) {
+    console.error('');
+    console.error(`  ❌ REFUSING TO START: T3MP3ST_HOST=${HOST} exposes this command-executing API`);
+    console.error('     to the network, but T3MP3ST_TOKEN is not set. Set T3MP3ST_TOKEN to a');
+    console.error('     strong secret (every /api request must then send `Authorization: Bearer');
+    console.error('     <token>`), or unset T3MP3ST_HOST to stay on the loopback-only default.');
+    console.error('');
+    process.exit(1);
+  }
+
   app.listen(Number(PORT), HOST, () => {
     console.log(`[T3MP3ST] Server running at http://${HOST}:${PORT}`);
     console.log(`[T3MP3ST] Web UI available at http://${HOST}:${PORT}/ui`);
     if (!HOST_IS_LOOPBACK) {
       console.warn('');
-      console.warn(`  ⚠️  EXPOSURE WARNING: bound to NON-LOOPBACK host "${HOST}". This API executes`);
-      console.warn('     commands and has NO built-in authentication — the Origin/Host guards only');
-      console.warn('     cover the localhost threat model. Do NOT put this on a LAN or the internet');
-      console.warn('     without real auth (a Bearer-token reverse proxy) in front of it.');
+      if (EXPLICIT_NON_LOOPBACK_HOST && API_BEARER_TOKEN) {
+        console.warn(`  ⚠️  EXPOSURE NOTICE: bound to NON-LOOPBACK host "${HOST}". Bearer auth is`);
+        console.warn('     ENFORCED on every /api route (Authorization: Bearer <T3MP3ST_TOKEN>).');
+        console.warn('     Keep the token secret and prefer TLS in front of this plain-HTTP server.');
+      } else {
+        console.warn(`  ⚠️  EXPOSURE WARNING: bound to NON-LOOPBACK host "${HOST}". This API executes`);
+        console.warn('     commands and has NO built-in authentication in this mode — the Origin/Host');
+        console.warn('     guards only cover the localhost threat model (docker-compose publishes');
+        console.warn('     127.0.0.1 only). Do NOT route LAN/internet traffic to this port without');
+        console.warn('     real auth in front of it.');
+      }
       console.warn('');
     }
     console.log('');

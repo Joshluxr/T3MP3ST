@@ -85,7 +85,7 @@ Open:
 http://127.0.0.1:3333/ui/
 ```
 
-The server binds to `127.0.0.1` by default. Do not expose it to a network unless you understand the command-execution and browser-origin risk. If you intentionally bind elsewhere with `T3MP3ST_HOST`, put it behind your own access control.
+The server binds to `127.0.0.1` by default. Do not expose it to a network unless you understand the command-execution and browser-origin risk. If you intentionally bind elsewhere with `T3MP3ST_HOST`, you must also set `T3MP3ST_TOKEN` — the server refuses to start otherwise, and every API call then requires `Authorization: Bearer <T3MP3ST_TOKEN>`. Prefer TLS in front of it as well.
 
 If you need outbound test traffic to use a SOCKS5 proxy, configure it with `TEMPEST_PROXY_URL` or through the War Room settings. The expected form is:
 

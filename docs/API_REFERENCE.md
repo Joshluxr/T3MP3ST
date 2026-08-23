@@ -29,6 +29,8 @@ The API is a local operator surface, not a multi-user internet service.
   (`/api/health` stays open for liveness probes)
 - A client-supplied local-LLM `baseUrl` is restricted to loopback / RFC1918 / ULA / LAN hostnames;
   link-local (cloud metadata) and public literal IPs need `T3MP3ST_LOCAL_BASE_URL_ALLOWLIST`
+- Persistence: `T3MP3ST_STATE_DIR` wins when set; otherwise `T3MP3ST_MODE=t3mp3st` persists under `~/.t3mp3st/organs/t3mp3st` and standalone mode stays memory-only
+- Live bounty submit (`dryRun:false`) requires a confirmed one-shot submission receipt from `POST /api/bounty/submission-receipts` (+ `/confirm`)
 - State-changing requests are guarded against foreign browser origins
 - Loopback binds reject non-loopback Host headers to reduce DNS-rebinding risk
 - Active or networked tool use should have a scope/authorization receipt
@@ -229,5 +231,7 @@ Repository paths are contained by resolver logic before analysis. Keep that cont
 | `GET` | `/api/bounty/platforms` | Supported bounty platforms |
 | `GET` | `/api/bounty/programs/:platform` | Programs for a platform |
 | `GET` | `/api/bounty/credentials` | Credential readiness |
-| `POST` | `/api/bounty/format` | Format a report |
-| `POST` | `/api/bounty/submit` | Submit through configured platform integration |
+| `POST` | `/api/bounty/format` | Format a report (includes `reportDigest`) |
+| `POST` | `/api/bounty/submission-receipts` | Issue a one-shot live-submission receipt bound to a report digest |
+| `POST` | `/api/bounty/submission-receipts/:id/confirm` | Confirm a pending receipt after operator review |
+| `POST` | `/api/bounty/submit` | Submit (dry-run default; live requires confirmed `receiptId`) |

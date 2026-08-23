@@ -76,7 +76,7 @@ describe('LLM baseUrl SSRF hardening', () => {
 
   it('routes the /api/models caller-supplied baseUrl through the same SSRF guard', () => {
     const models = sourceBlock("app.post('/api/models'", 'TOOL EXECUTION ENDPOINTS');
-    expect(models).toContain('sanitizeLocalBaseUrl(rawBodyBaseUrl)');
+    expect(models).toContain('sanitizeLocalBaseUrlChecked(rawBodyBaseUrl)');
     expect(models).toContain('res.status(400).json({ error: buCheck.error })');
   });
 });

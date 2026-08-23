@@ -766,21 +766,39 @@ export function ingestRepository(config: IngestConfig): IngestResult {
   const allBlocks: CodeBlock[] = [];
   let processedFiles = 0;
   for (const path of files) {
+    const remainingBytes = maxTotalBytes === undefined ? undefined : Math.max(0, maxTotalBytes - totalBytes);
+    if (remainingBytes === 0) { truncated = true; break; }
+    if (remainingBytes !== undefined) {
+      try {
+        // Skip oversized files before readFileSync can allocate past the configured ceiling.
+        if (statSync(path).size > remainingBytes) {
+          truncated = true;
+          continue;
+        }
+      } catch {
+        continue;
+      }
+    }
     let content: string;
     try {
       content = readFileSync(path, 'utf8');
     } catch {
       continue;
     }
+    const contentBytes = Buffer.byteLength(content, 'utf8');
+    // Defend the stat/read race if the file grows between the two operations.
+    if (remainingBytes !== undefined && contentBytes > remainingBytes) {
+      truncated = true;
+      continue;
+    }
     processedFiles += 1;
-    totalBytes += content.length;
+    totalBytes += contentBytes;
     // Multi-language dispatch: .py uses the legacy regex parser; supported
     // non-Python languages use tree-sitter and yield [] when their grammar is
     // unavailable. Stays sync — parseFileMultiLang does not await.
     allBlocks.push(...parseFileMultiLang(path, content, extname(path).toLowerCase()));
     if (maxTotalBytes !== undefined && totalBytes >= maxTotalBytes) {
       truncated = true;
-      console.warn(`[code-ingest] ingest reached maxTotalBytes ceiling (${maxTotalBytes}) after ${totalBytes} bytes; remaining files skipped — raise IngestConfig.maxTotalBytes to analyze more.`);
       break;
     }
   }

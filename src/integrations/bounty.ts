@@ -24,6 +24,7 @@
 
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'crypto';
 
 // =============================================================================
 // TYPES
@@ -90,6 +91,17 @@ export interface BountyReport {
   checklist: string[];
 }
 
+export interface LiveSubmissionConfirmation {
+  receiptId: string;
+  reportDigest: string;
+  confirmedAt: string;
+}
+
+export interface BountySubmitOptions {
+  dryRun?: boolean;
+  confirmation?: LiveSubmissionConfirmation;
+}
+
 export interface BountySubmitResult {
   success: boolean;
   reportId?: string;
@@ -103,7 +115,7 @@ export interface BountyConnector {
   platform: BountyPlatform;
   formatReport(finding: BountyFinding, programHandle: string): BountyReport;
   validateScope(finding: BountyFinding, program: BountyProgram): { inScope: boolean; reason: string };
-  submit(report: BountyReport, credentials: BountyCredentials, opts: { dryRun?: boolean }): Promise<BountySubmitResult>;
+  submit(report: BountyReport, credentials: BountyCredentials, opts?: BountySubmitOptions): Promise<BountySubmitResult>;
   listPrograms(query: string, credentials: BountyCredentials): Promise<BountyProgram[]>;
 }
 
@@ -128,6 +140,27 @@ function buildMarkdownReport(f: BountyFinding): string {
   if (f.component) md += `## Affected Component\n\n${f.component}\n\n`;
   if (f.versionsAffected) md += `## Versions Affected\n\n${f.versionsAffected}\n\n`;
   return md;
+}
+
+export function bountyReportDigest(report: BountyReport): string {
+  const boundReport = {
+    platform: report.platform,
+    programHandle: report.programHandle,
+    title: report.title,
+    severity: report.severity,
+    body: report.body,
+    structuredData: report.structuredData ?? null,
+    apiPayload: report.apiPayload ?? null,
+    checklist: report.checklist,
+  };
+  return createHash('sha256').update(JSON.stringify(boundReport)).digest('hex');
+}
+
+function liveConfirmationError(report: BountyReport, opts: BountySubmitOptions): string | undefined {
+  if (!opts.confirmation) return 'Live submission requires an explicit confirmed submission receipt.';
+  if (!opts.confirmation.receiptId || !opts.confirmation.confirmedAt) return 'Live submission confirmation receipt is incomplete.';
+  if (opts.confirmation.reportDigest !== bountyReportDigest(report)) return 'Live submission confirmation does not match this exact report.';
+  return undefined;
 }
 
 const BASE_CHECKLIST = [
@@ -185,9 +218,11 @@ export const hackeroneConnector: BountyConnector = {
   },
 
   async submit(report: BountyReport, credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) {
+    if (opts.dryRun !== false) {
       return { success: true, confirmed: false, reportId: 'DRY-RUN', reportUrl: `https://hackerone.com/${report.programHandle}/reports/DRY-RUN` };
     }
+    const confirmationError = liveConfirmationError(report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
     if (!credentials.apiKey || !credentials.apiIdentifier) {
       return { success: false, confirmed: false, error: 'HackerOne requires both apiKey and apiIdentifier' };
     }
@@ -270,9 +305,11 @@ export const bugcrowdConnector: BountyConnector = {
   },
 
   async submit(report: BountyReport, credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) {
+    if (opts.dryRun !== false) {
       return { success: true, confirmed: false, reportId: 'DRY-RUN' };
     }
+    const confirmationError = liveConfirmationError(report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
     if (!credentials.apiKey) {
       return { success: false, confirmed: false, error: 'Bugcrowd requires an API token' };
     }
@@ -343,8 +380,10 @@ export const intigritiConnector: BountyConnector = {
   },
 
   async submit(_report: BountyReport, _credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
-    return { success: false, confirmed: false, error: 'Intigriti submission requires their web portal — use formatReport to prepare, then submit manually' };
+    if (opts.dryRun !== false) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
+    const confirmationError = liveConfirmationError(_report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
+    return { success: false, confirmed: true, error: 'Intigriti submission requires their web portal — use formatReport to prepare, then submit manually' };
   },
 
   async listPrograms(_query: string, _credentials: BountyCredentials): Promise<BountyProgram[]> {
@@ -397,8 +436,10 @@ export const immunefiConnector: BountyConnector = {
   },
 
   async submit(_report: BountyReport, _credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
-    return { success: false, confirmed: false, error: 'Immunefi submissions go through bugs.immunefi.com — use formatReport to prepare, then submit via their portal' };
+    if (opts.dryRun !== false) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
+    const confirmationError = liveConfirmationError(_report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
+    return { success: false, confirmed: true, error: 'Immunefi submissions go through bugs.immunefi.com — use formatReport to prepare, then submit via their portal' };
   },
 
   async listPrograms(_query: string, _credentials: BountyCredentials): Promise<BountyProgram[]> {
@@ -446,8 +487,10 @@ export const huntrConnector: BountyConnector = {
   },
 
   async submit(_report: BountyReport, _credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
-    return { success: false, confirmed: false, error: 'Huntr submission requires their web portal at huntr.com — use formatReport to prepare' };
+    if (opts.dryRun !== false) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
+    const confirmationError = liveConfirmationError(_report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
+    return { success: false, confirmed: true, error: 'Huntr submission requires their web portal at huntr.com — use formatReport to prepare' };
   },
 
   async listPrograms(_query: string, _credentials: BountyCredentials): Promise<BountyProgram[]> {
@@ -495,8 +538,10 @@ export const code4renaConnector: BountyConnector = {
   },
 
   async submit(_report: BountyReport, _credentials: BountyCredentials, opts = {}): Promise<BountySubmitResult> {
-    if (opts.dryRun) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
-    return { success: false, confirmed: false, error: 'Code4rena submissions go through their contest portal — use formatReport to prepare your finding in C4 format' };
+    if (opts.dryRun !== false) return { success: true, confirmed: false, reportId: 'DRY-RUN' };
+    const confirmationError = liveConfirmationError(_report, opts);
+    if (confirmationError) return { success: false, confirmed: false, error: confirmationError };
+    return { success: false, confirmed: true, error: 'Code4rena submissions go through their contest portal — use formatReport to prepare your finding in C4 format' };
   },
 
   async listPrograms(_query: string, _credentials: BountyCredentials): Promise<BountyProgram[]> {

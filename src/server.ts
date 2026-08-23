@@ -12,10 +12,14 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { execFile, spawn } from 'child_process';
-import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
+import { appendFile, mkdir, readFile, rename, writeFile } from 'fs/promises';
+import { lookup } from 'dns/promises';
 import { join } from 'path';
+import { homedir } from 'os';
 import { promisify } from 'util';
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
+import { inspectCurlArgs } from './server/curl-policy.js';
+import { SubmissionReceiptError, SubmissionReceiptStore } from './server/bounty-confirmation.js';
 import { config, AVAILABLE_MODELS } from './config/index.js';
 import { resolveModels } from './config/provider-models.js';
 import { initProxyFromConfig, configureProxy, getProxyStatus, checkIp, invalidateIpCache } from './net/proxy.js';
@@ -425,6 +429,60 @@ function sanitizeLocalBaseUrl(raw: unknown): { ok: true; value: string | null } 
   return { ok: true, value: v };
 }
 
+// Resolved-address counterpart to isPrivateOrLoopbackIPv4: used by the DNS check
+// below on ACTUAL lookup results, so a hostname that passed the syntactic check is
+// still caught when it resolves to a public/metadata address (hostile-DNS /
+// DNS-rebinding SSRF). Whitelist posture: anything not explicitly private or
+// loopback is rejected.
+function isPrivateOrLoopbackAddress(address: string): boolean {
+  let addr = address.toLowerCase();
+  // IPv4-mapped IPv6 (::ffff:127.0.0.1) — unwrap and vet as IPv4.
+  if (addr.startsWith('::ffff:')) addr = addr.slice(7);
+  if (addr.includes(':')) {
+    return addr === '::1' || addr.startsWith('fc') || addr.startsWith('fd');
+  }
+  return isPrivateOrLoopbackIPv4(addr);
+}
+
+// Async DNS guard closing the rebinding gap in sanitizeLocalBaseUrl: a non-literal
+// LAN hostname is operator-trusted, but DNS answers are not — a hostile name can
+// resolve to 169.254.169.254 or a public IP at fetch time. Resolve the host and
+// require EVERY answer to be loopback/RFC1918/ULA; fail closed on DNS error (a
+// name that can't be vetted is never fetched). Skipped for IP literals (already
+// vetted syntactically), localhost, and operator-allowlisted hosts.
+async function validateLocalBaseUrlDns(hostname: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (LOCAL_BASE_URL_ALLOWLIST.has(host)) return { ok: true };
+  if (host === 'localhost' || host.endsWith('.localhost')) return { ok: true };
+  // IP literals (IPv4/IPv6) were vetted syntactically by isAllowedLocalBaseUrlHost.
+  if (host === '::1' || host.includes(':') || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return { ok: true };
+  let answers: Array<{ address: string }>;
+  try {
+    answers = await lookup(host, { all: true, verbatim: true });
+  } catch {
+    return { ok: false, error: `baseUrl host '${host}' could not be resolved — refusing to fetch an unverifiable destination` };
+  }
+  if (!answers.length || !answers.every((a) => isPrivateOrLoopbackAddress(a.address))) {
+    return {
+      ok: false,
+      error: `baseUrl host '${host}' resolves outside loopback/private/LAN address space — refusing the fetch (DNS-rebinding/SSRF guard). Override with T3MP3ST_LOCAL_BASE_URL_ALLOWLIST.`,
+    };
+  }
+  return { ok: true };
+}
+
+// sanitizeLocalBaseUrl PLUS the DNS-resolution check. Every outbound-fetch call
+// site must use this variant — the sync check alone can't see where a hostname
+// actually points at fetch time.
+async function sanitizeLocalBaseUrlChecked(raw: unknown): Promise<{ ok: true; value: string | null } | { ok: false; error: string }> {
+  const sync = sanitizeLocalBaseUrl(raw);
+  if (!sync.ok || !sync.value) return sync;
+  const dnsCheck = await validateLocalBaseUrlDns(new URL(sync.value).hostname);
+  if (!dnsCheck.ok) return { ok: false, error: dnsCheck.error };
+  return sync;
+}
+
+
 function createTempestCommandInstance(missionName: string, apiKey: string | undefined, provider: string, model: string, baseUrl?: string): TempestCommand {
   // Tear down previous instance
   if (tempestCommand) {
@@ -479,84 +537,11 @@ interface ToolResult {
 interface ParsedCommand {
   bin: string;
   args: string[];
+  networkTarget?: string;
 }
 
 const SHELL_META = /[|&;$<>`\\]/;
 const COMMAND_CONTROL = /[\x00-\x1F\x7F-\x9F\u2028\u2029]/;
-const CURL_TRANSPORT_OVERRIDE_FLAGS = new Set([
-  '--resolve',
-  '--connect-to',
-  '--proxy',
-  '--preproxy',
-  '--socks4',
-  '--socks4a',
-  '--socks5',
-  '--socks5-hostname',
-  '--unix-socket',
-  '--abstract-unix-socket',
-  '--interface',
-  '--url',
-  '--config',
-  '--next',
-  '-x',
-  '-K',
-]);
-const CURL_VALUE_FLAGS = new Set([
-  '-A', '--user-agent',
-  '-b', '--cookie',
-  '-c', '--cookie-jar',
-  '-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode',
-  '-F', '--form',
-  '-H', '--header',
-  '-m', '--max-time',
-  '-o', '--output',
-  '-T', '--upload-file',
-  '-u', '--user',
-  '-X', '--request',
-  '--cacert', '--cert', '--connect-timeout', '--key', '--request-target', '--retry',
-]);
-
-function findCurlTransportOverrideFlag(args: string[]): string | undefined {
-  for (const arg of args) {
-    if (!arg) continue;
-    const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
-    if (CURL_TRANSPORT_OVERRIDE_FLAGS.has(flag)) return flag;
-    if (arg.startsWith('-x') && arg !== '-X' && arg.length > 2) return '-x';
-    if (arg.startsWith('-K') && arg.length > 2) return '-K';
-  }
-  return undefined;
-}
-
-function looksLikeCurlUrlOperand(arg: string): boolean {
-  return /^[a-z][a-z0-9+.-]*:\/\/\S+/i.test(arg)
-    || /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:[/?#].*)?$/i.test(arg)
-    || /^(?:localhost|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?(?:[/?#].*)?$/i.test(arg)
-    || /^\[[0-9a-f:]+\](?::\d+)?(?:[/?#].*)?$/i.test(arg);
-}
-
-function countCurlUrlOperands(args: string[]): number {
-  let count = 0;
-  let skipNext = false;
-  let endOfOptions = false;
-  for (const arg of args) {
-    if (!arg) continue;
-    if (skipNext) { skipNext = false; continue; }
-    if (!endOfOptions && arg === '--') { endOfOptions = true; continue; }
-    if (!endOfOptions && arg.startsWith('--')) {
-      const hasInlineValue = arg.includes('=');
-      const flag = hasInlineValue ? arg.slice(0, arg.indexOf('=')) : arg;
-      if (!hasInlineValue && CURL_VALUE_FLAGS.has(flag)) skipNext = true;
-      continue;
-    }
-    if (!endOfOptions && arg.startsWith('-')) {
-      if (arg.length === 2 && CURL_VALUE_FLAGS.has(arg)) skipNext = true;
-      continue;
-    }
-    if (looksLikeCurlUrlOperand(arg)) count += 1;
-  }
-  return count;
-}
-
 function parseCommand(command: string): ParsedCommand | { error: string } {
   if (SHELL_META.test(command) || COMMAND_CONTROL.test(command)) return { error: 'Shell control characters are not allowed; use direct argv-style commands only.' };
   const parts = command.match(/"[^"]*"|'[^']*'|\S+/g)?.map(part => part.replace(/^["']|["']$/g, '')) || [];
@@ -568,19 +553,17 @@ function parseCommand(command: string): ParsedCommand | { error: string } {
     return { error: `Tool is catalog-only and cannot be executed directly: ${bin}` };
   }
   if (bin === 'curl') {
-    const overrideFlag = findCurlTransportOverrideFlag(args);
-    if (overrideFlag) {
-      return { error: `curl flag ${overrideFlag} changes the effective network destination and is not allowed through /api/tools/execute.` };
-    }
-    if (countCurlUrlOperands(args) > 1) {
-      return { error: 'curl commands with multiple URL operands are not allowed through /api/tools/execute; submit one transfer per approved target.' };
-    }
+    const inspection = inspectCurlArgs(args);
+    if ('error' in inspection) return inspection;
+    // -q suppresses ~/.curlrc; --noproxy prevents proxy env from changing destination.
+    return { bin, args: ['-q', '--noproxy', '*', ...args], networkTarget: inspection.target };
   }
   return { bin, args };
 }
 
 function inferCommandTarget(parsed: ParsedCommand): string {
   if (!NETWORK_COMMANDS.has(parsed.bin)) return 'local-host';
+  if (parsed.networkTarget) return parsed.networkTarget;
   const positional = parsed.args.filter(arg => arg && !arg.startsWith('-'));
   return positional[positional.length - 1] || 'unknown-network-target';
 }
@@ -615,6 +598,8 @@ function resolveCommandExecutionTarget(
 
   return { target: inferredTarget };
 }
+
+
 
 async function executeCommand(command: string, timeout = 30000): Promise<ToolResult> {
   const startTime = Date.now();
@@ -1014,8 +999,14 @@ function currentMode(): TempestMode {
 }
 
 function stateRoot(): string {
-  return process.env.T3MP3ST_STATE_DIR ||
-    (process.env.T3MP3ST_STATE_DIR ? `${process.env.T3MP3ST_STATE_DIR}/organs/t3mp3st` : 'memory');
+  if (process.env.T3MP3ST_STATE_DIR) return process.env.T3MP3ST_STATE_DIR;
+  // currentMode() already treats T3MP3ST_MODE=t3mp3st as t3mp3st mode, but the
+  // previous branch here re-tested T3MP3ST_STATE_DIR (always falsy on this path)
+  // and silently fell back to ephemeral in-memory state. Honor the mode: t3mp3st
+  // mode persists under the conventional ~/.t3mp3st dir; standalone stays memory-only.
+  return process.env.T3MP3ST_MODE === 't3mp3st'
+    ? join(homedir(), '.t3mp3st', 'organs', 't3mp3st')
+    : 'memory';
 }
 
 function stateFilePath(): string | null {
@@ -1201,11 +1192,25 @@ function buildStateSnapshot(): Record<string, unknown> {
   };
 }
 
+// Writes are SERIALIZED through persistChain: debounced bursts can otherwise
+// overlap, and two in-flight async writes may complete out of order, letting an
+// OLDER snapshot overwrite a NEWER one under slow I/O. Each write is also ATOMIC
+// (tmp file + rename) so a crash mid-write can't leave a truncated state.json
+// that the next restore would fail to parse.
+let persistChain: Promise<void> = Promise.resolve();
 async function persistState(reason = 'state.updated'): Promise<void> {
   const file = stateFilePath();
   if (!file) return;
-  await mkdir(stateRoot(), { recursive: true });
-  await writeFile(file, JSON.stringify(redactSecrets({ ...buildStateSnapshot(), reason }), null, 2));
+  const run = persistChain.then(async () => {
+    await mkdir(stateRoot(), { recursive: true });
+    const tmp = `${file}.tmp`;
+    await writeFile(tmp, JSON.stringify(redactSecrets({ ...buildStateSnapshot(), reason }), null, 2));
+    await rename(tmp, file);
+  });
+  // Keep the chain alive across failures so one bad write can't wedge every
+  // later snapshot; callers still see THIS write's outcome via `run`.
+  persistChain = run.catch(() => { /* chain continuity only — callers log their own rejection */ });
+  return run;
 }
 
 // Debounced full-snapshot writer. persistState re-serializes the ENTIRE (growing) snapshot,
@@ -1241,6 +1246,8 @@ async function flushPersist(): Promise<void> {
     persistPending = false;
     await persistState(persistReason);
   }
+  // Drain any write already in flight so SIGTERM can't exit mid-rename.
+  await persistChain;
 }
 
 async function appendStateEvent(type: string, payload: Record<string, unknown>): Promise<void> {
@@ -5121,11 +5128,22 @@ app.post('/api/approvals/:id/approve', (req: Request, res: Response) => {
     res.status(404).json({ error: 'Approval request not found' });
     return;
   }
+  // Rejected / expired / already-approved receipts must not be reactivated — mint a
+  // fresh pending receipt instead (same transition rules as authorize-target).
+  if (approval.status !== 'pending') {
+    res.status(409).json({
+      error: 'Approval request is not pending',
+      approvalId: approval.id,
+      status: approval.status,
+      next: 'Request a new pending receipt, then approve that exact id.',
+    });
+    return;
+  }
   const body = req.body as Record<string, unknown>;
-  const ttlMinutes = Number(body.ttlMinutes || 30);
+  const ttlMinutes = Math.max(1, Math.min(30, Number(body.ttlMinutes || 30)));
   approval.status = 'approved';
   approval.approvedBy = typeof body.approvedBy === 'string' ? body.approvedBy : 'local-operator';
-  approval.expiresAt = new Date(Date.now() + Math.max(1, ttlMinutes) * 60_000).toISOString();
+  approval.expiresAt = new Date(Date.now() + ttlMinutes * 60_000).toISOString();
   approval.updatedAt = nowIso();
   emitContractEvent('approval.approved', { approvalId: approval.id, action: approval.action, target: approval.target });
   res.json(approval);
@@ -6263,7 +6281,7 @@ app.post('/api/models', async (req: Request, res: Response): Promise<void> => {
   // A caller-supplied baseUrl is an outbound-fetch destination: run it through the
   // same loopback/private/LAN restriction as the local-LLM proxy (SSRF guard).
   const rawBodyBaseUrl = typeof body.baseUrl === 'string' && body.baseUrl.trim() ? body.baseUrl : undefined;
-  const buCheck = sanitizeLocalBaseUrl(rawBodyBaseUrl);
+  const buCheck = await sanitizeLocalBaseUrlChecked(rawBodyBaseUrl);
   if (!buCheck.ok) { res.status(400).json({ error: buCheck.error }); return; }
   const bodyBaseUrl = buCheck.value ?? undefined;
   const bodyKey = typeof body.apiKey === 'string' && body.apiKey ? body.apiKey : undefined;
@@ -6380,9 +6398,9 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
   // SECURITY NOTE: apiKey is read from the request body (Authorization header is
   // preferred). Kept body-accepted for the same-origin UI; only reachable from
   // the local operator (loopback bind + origin guard). Header move is out of scope.
-  const missionLLMConfig = baseUrl === undefined
+  const missionLLMConfig = await (baseUrl === undefined
     ? resolveGeneralLLMConfig(provider, model, apiKey)
-    : resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+    : resolveGeneralLLMConfig(provider, model, apiKey, baseUrl));
   const effectiveKey = missionLLMConfig.apiKey;
   if (providerNeedsApiKey(missionLLMConfig.provider) && !effectiveKey) {
     res.status(400).json({ error: 'API key required — pass apiKey, configure one on the server, or connect a supported local agent' });
@@ -6809,13 +6827,6 @@ app.post('/api/operators/:id/task', async (req: Request, res: Response): Promise
     createdAt: Date.now(),
   };
 
-  broadcastEvent('task:dispatched', {
-    taskId: task.id,
-    operatorId: operator.id,
-    callsign: operator.callsign,
-    taskName,
-  });
-
   // Execute asynchronously — return immediately with task ID
   const targets = cmd.targetEnv.getAllTargets();
   if (targets.length === 0) {
@@ -6823,6 +6834,16 @@ app.post('/api/operators/:id/task', async (req: Request, res: Response): Promise
     return;
   }
   const target = targets[0];
+
+  // Broadcast only AFTER the request is validated: a dispatch that 400s must not
+  // announce task:dispatched for a task that will never run — SSE consumers would
+  // track a phantom task that never completes or fails.
+  broadcastEvent('task:dispatched', {
+    taskId: task.id,
+    operatorId: operator.id,
+    callsign: operator.callsign,
+    taskName,
+  });
 
   operator.assignTask(task, target).then((result) => {
     broadcastEvent('task:completed', {
@@ -6902,7 +6923,7 @@ function readGeneralTimeoutEnv(): number | undefined {
 // the key in the body, so we accept it to avoid breaking it. Moving to a header
 // needs a coordinated UI change and is out of scope. The body key is only ever
 // reachable from the local operator (loopback bind + origin guard).
-function resolveGeneralLLMConfig(provider: string | undefined, model: string | undefined, apiKey: string | undefined, baseUrl?: string): {
+async function resolveGeneralLLMConfig(provider: string | undefined, model: string | undefined, apiKey: string | undefined, baseUrl?: string): Promise<{
   provider: any;
   model: string;
   apiKey?: string;
@@ -6910,7 +6931,7 @@ function resolveGeneralLLMConfig(provider: string | undefined, model: string | u
   maxTokens: number;
   temperature: number;
   timeout: number;
-} {
+}> {
   const defaultConfig = config.getLLMConfig();
   const selectedProvider = provider || defaultConfig.provider;
   // Local-agent backends use their own CLI login and need no T3MP3ST API key.
@@ -6931,7 +6952,7 @@ function resolveGeneralLLMConfig(provider: string | undefined, model: string | u
   // redirect a cloud call. A malformed/non-HTTP URL throws (callers already 400 on throw).
   let localBaseUrl: string | null = null;
   if (selectedProvider === 'local') {
-    const bu = sanitizeLocalBaseUrl(baseUrl);
+    const bu = await sanitizeLocalBaseUrlChecked(baseUrl);
     if (!bu.ok) throw new Error(bu.error);
     localBaseUrl = bu.value;
   }
@@ -7132,7 +7153,7 @@ app.post('/api/llm/local', async (req: Request, res: Response): Promise<void> =>
     return;
   }
 
-  const bu = sanitizeLocalBaseUrl(baseUrl);
+  const bu = await sanitizeLocalBaseUrlChecked(baseUrl);
   if (!bu.ok) { res.status(400).json({ error: bu.error }); return; }
   const clientBaseUrl = bu.value || '';
   const clientApiKey = (typeof apiKey === 'string' && apiKey.trim()) ? apiKey.trim() : '';
@@ -7227,7 +7248,7 @@ app.post('/api/general/plan', async (req: Request, res: Response): Promise<void>
   }
 
   try {
-    const generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+    const generalConfig = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
     // Create a dedicated LLM backbone for the General
     const generalLLM = new LLMBackbone(generalConfig);
 
@@ -7298,7 +7319,7 @@ app.post('/api/general/execute', async (req: Request, res: Response): Promise<vo
 
   let generalConfig;
   try {
-    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+    generalConfig = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
   } catch (error: any) {
     res.status(400).json({ error: error.message || 'API key required' });
     return;
@@ -7418,7 +7439,7 @@ app.post('/api/general/auto', async (req: Request, res: Response): Promise<void>
 
   let generalConfig;
   try {
-    generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+    generalConfig = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
   } catch (error: any) {
     res.status(400).json({ error: error.message || 'API key required' });
     return;
@@ -7678,7 +7699,7 @@ app.post('/api/admiral/converse', async (req: Request, res: Response): Promise<v
     if (llm) {
       admiralLLM = llm;
     } else {
-      const cfg = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+      const cfg = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
       admiralLLM = new LLMBackbone(cfg);
     }
     const admiral = new Admiral(admiralLLM);
@@ -7712,7 +7733,7 @@ app.post('/api/admiral/suggest', async (req: Request, res: Response): Promise<vo
     let admiralLLM: LLMBackbone;
     if (llm) { admiralLLM = llm; }
     else {
-      const cfg = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+      const cfg = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
       admiralLLM = new LLMBackbone(cfg);
     }
     const admiral = new Admiral(admiralLLM);
@@ -7749,7 +7770,7 @@ app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<voi
 
     let generalConfig;
     try {
-      generalConfig = resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
+      generalConfig = await resolveGeneralLLMConfig(provider, model, apiKey, baseUrl);
     } catch (error: any) {
       res.status(400).json({ error: error.message || 'API key required' });
       return;
@@ -7823,9 +7844,11 @@ app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<voi
 
 import {
   getConnector, listConnectors, findingToBountyFinding,
-  loadBountyCredentials,
+  loadBountyCredentials, bountyReportDigest,
   type BountyPlatform, type BountyCredentials,
 } from './integrations/bounty.js';
+
+const bountySubmissionReceipts = new SubmissionReceiptStore();
 
 app.get('/api/bounty/platforms', (_req: Request, res: Response) => {
   res.json({
@@ -7848,16 +7871,56 @@ app.post('/api/bounty/format', (req: Request, res: Response) => {
     const connector = getConnector(platform);
     const bountyFinding = findingToBountyFinding(finding);
     const report = connector.formatReport(bountyFinding, programHandle);
-    res.json({ report });
+    res.json({ report, reportDigest: bountyReportDigest(report) });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }
 });
 
+// Issue a one-shot live-submission receipt bound to an exact report digest. The
+// operator must confirm it before /api/bounty/submit accepts dryRun:false.
+app.post('/api/bounty/submission-receipts', (req: Request, res: Response) => {
+  try {
+    const { platform, programHandle, finding } = req.body as {
+      platform: BountyPlatform; programHandle: string; finding: Record<string, any>;
+    };
+    if (!platform || !programHandle || !finding) {
+      res.status(400).json({ error: 'Required: platform, programHandle, finding' });
+      return;
+    }
+    const connector = getConnector(platform);
+    const report = connector.formatReport(findingToBountyFinding(finding), programHandle);
+    const receipt = bountySubmissionReceipts.issue(report);
+    res.status(201).json({
+      receipt,
+      report,
+      reportDigest: receipt.reportDigest,
+      next: `Review the report, then POST { confirmed:true, reportDigest } to /api/bounty/submission-receipts/${receipt.id}/confirm before live submit.`,
+    });
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.post('/api/bounty/submission-receipts/:id/confirm', (req: Request, res: Response) => {
+  try {
+    const body = req.body as { confirmed?: boolean; reportDigest?: string };
+    if (body.confirmed !== true || typeof body.reportDigest !== 'string') {
+      res.status(400).json({ error: 'confirmed:true and the reviewed reportDigest are required.' });
+      return;
+    }
+    const receipt = bountySubmissionReceipts.confirm(req.params.id, body.reportDigest);
+    res.json({ receipt });
+  } catch (error: any) {
+    const status = error instanceof SubmissionReceiptError ? error.statusCode : 400;
+    res.status(status).json({ error: error.message });
+  }
+});
+
 app.post('/api/bounty/submit', async (req: Request, res: Response) => {
   try {
-    const { platform, programHandle, finding, dryRun } = req.body as {
-      platform: BountyPlatform; programHandle: string; finding: Record<string, any>; dryRun?: boolean;
+    const { platform, programHandle, finding, dryRun, receiptId } = req.body as {
+      platform: BountyPlatform; programHandle: string; finding: Record<string, any>; dryRun?: boolean; receiptId?: string;
     };
     if (!platform || !programHandle || !finding) {
       res.status(400).json({ error: 'Required: platform, programHandle, finding' });
@@ -7868,8 +7931,26 @@ app.post('/api/bounty/submit', async (req: Request, res: Response) => {
     const connector = getConnector(platform);
     const bountyFinding = findingToBountyFinding(finding);
     const report = connector.formatReport(bountyFinding, programHandle);
-    const result = await connector.submit(report, platformCreds, { dryRun: dryRun !== false });
-    res.json({ result, report });
+    const isDryRun = dryRun !== false;
+    if (!isDryRun) {
+      if (typeof receiptId !== 'string' || !receiptId) {
+        res.status(403).json({
+          error: 'receiptId from an explicitly confirmed submission receipt is required for live submission.',
+          next: 'POST /api/bounty/submission-receipts, confirm it, then submit with dryRun:false and that receiptId.',
+        });
+        return;
+      }
+    }
+    let confirmation;
+    try {
+      confirmation = isDryRun ? undefined : bountySubmissionReceipts.claim(receiptId as string, report);
+    } catch (error: any) {
+      const status = error instanceof SubmissionReceiptError ? error.statusCode : 400;
+      res.status(status).json({ error: error.message });
+      return;
+    }
+    const result = await connector.submit(report, platformCreds, { dryRun: isDryRun, confirmation });
+    res.json({ result, report, reportDigest: bountyReportDigest(report) });
   } catch (error: any) {
     res.status(400).json({ error: error.message });
   }

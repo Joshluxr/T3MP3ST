@@ -4,6 +4,7 @@ import { join } from 'path';
 
 const serverSource = readFileSync(join(process.cwd(), 'src/server.ts'), 'utf8');
 const uiSource = readFileSync(join(process.cwd(), 'docs/index.html'), 'utf8');
+const curlPolicySource = readFileSync(join(process.cwd(), 'src/server/curl-policy.ts'), 'utf8');
 
 function sourceBlock(startMarker: string, endMarker: string): string {
   const start = serverSource.indexOf(startMarker);
@@ -63,29 +64,22 @@ describe('local API authorization hardening invariants', () => {
     expect(route).toMatch(/guardAction\(body,\s*['"]command_execution['"],\s*targetResolution\.target/);
   });
 
-  it('/api/tools/execute rejects curl flags that change the effective destination', () => {
-    const parser = sourceBlock('const CURL_TRANSPORT_OVERRIDE_FLAGS', 'function inferCommandTarget');
-
+  it('/api/tools/execute rejects curl destination overrides, redirects, and file-backed inputs', () => {
     for (const flag of [
-      '--resolve',
-      '--connect-to',
-      '--proxy',
-      '--preproxy',
-      '--socks5',
-      '--socks5-hostname',
-      '--unix-socket',
-      '--interface',
-      '--url',
-      '--config',
-      '--next',
-      '-K',
+      '--resolve', '--connect-to', '--proxy', '--preproxy', '--socks5', '--unix-socket',
+      '--interface', '--url', '--config', '--next', '--location', '--location-trusted', '--upload-file',
     ]) {
-      expect(parser).toContain(`'${flag}'`);
+      expect(curlPolicySource).toContain(`'${flag}'`);
     }
-    expect(parser).toMatch(/findCurlTransportOverrideFlag\(args\)/);
-    expect(parser).toMatch(/countCurlUrlOperands\(args\)\s*>\s*1/);
-    expect(parser).toMatch(/multiple URL operands/);
-    expect(parser).toMatch(/changes the effective network destination/);
+    expect(curlPolicySource).toContain('inspectCurlArgs');
+    expect(curlPolicySource).toMatch(/operands\.length !== 1/);
+    expect(curlPolicySource).toMatch(/valid HTTP\(S\) target/);
+    expect(serverSource).toMatch(/inspectCurlArgs\(args\)/);
+    expect(serverSource).toMatch(/networkTarget: inspection\.target/);
+    // Approve route must refuse non-pending receipts (no reactivate-after-reject).
+    const approve = sourceBlock("app.post('/api/approvals/:id/approve'", "app.post('/api/approvals/authorize-target'");
+    expect(approve).toMatch(/approval\.status !== 'pending'/);
+    expect(approve).toMatch(/res\.status\(409\)/);
   });
 
   it('Admiral live launch permits expanded targets only with explicit operator approval receipts', () => {

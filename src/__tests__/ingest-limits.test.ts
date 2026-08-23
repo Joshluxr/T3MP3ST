@@ -41,6 +41,16 @@ describe('ingest ceilings (bounded ingest, non-regressing)', () => {
     expect(res.stats.blocks).toBeGreaterThan(0);
   });
 
+  it('skips a single source file larger than the total byte budget before parsing it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 't3mp3st-ingest-oversize-')); dirs.push(dir);
+    writeFileSync(join(dir, 'oversize.py'), `def oversized():
+    return '${'x'.repeat(4096)}'
+`);
+    const res = ingestRepository(cfg(dir, { maxTotalBytes: 64 }));
+    expect(res.stats).toMatchObject({ files: 0, blocks: 0, truncated: true });
+    expect(res.analysisUnits).toHaveLength(0);
+  });
+
   it('a NORMAL ingest under the ceilings is unchanged — no truncated key', () => {
     const dir = makeRepo(10); dirs.push(dir);
     const res = ingestRepository(cfg(dir, { maxFiles: 50000, maxTotalBytes: 1_000_000_000 }));

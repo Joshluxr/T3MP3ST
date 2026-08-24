@@ -280,6 +280,68 @@ if (HOST_IS_LOOPBACK) {
 
 app.use(express.json({ limit: '10mb' }));
 
+// --- Panel login (username + password) --------------------------------------
+// Optional. When T3MP3ST_PANEL_USER + T3MP3ST_PANEL_PASSWORD_SHA256 (hex SHA-256
+// of the password, so the plaintext is never stored server-side) are set, every
+// request except /api/health and /api/panel/login must carry a valid
+// Authorization: Bearer <session-token> header. Tokens are random 32-byte hex,
+// kept in memory with a 12h TTL, and are invalidated on restart. This is the
+// "real auth" the exposure warning above asks for before a non-loopback bind.
+const PANEL_USER = process.env.T3MP3ST_PANEL_USER || '';
+const PANEL_PASSWORD_SHA256 = (process.env.T3MP3ST_PANEL_PASSWORD_SHA256 || '').toLowerCase();
+const PANEL_AUTH_ENABLED = !!(PANEL_USER && PANEL_PASSWORD_SHA256);
+const PANEL_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+const panelTokens = new Map<string, number>(); // token -> expiry epoch ms
+
+function sha256hex(s: string): string {
+  return createHash('sha256').update(s, 'utf8').digest('hex');
+}
+function issuePanelToken(): string {
+  const token = createHash('sha256').update(randomUUID() + randomUUID()).digest('hex');
+  panelTokens.set(token, Date.now() + PANEL_TOKEN_TTL_MS);
+  // opportunistic sweep of expired tokens
+  for (const [t, exp] of panelTokens) if (exp < Date.now()) panelTokens.delete(t);
+  return token;
+}
+function isValidPanelToken(token: string | undefined): boolean {
+  if (!token) return false;
+  const exp = panelTokens.get(token);
+  if (!exp) return false;
+  if (exp < Date.now()) { panelTokens.delete(token); return false; }
+  return true;
+}
+
+app.post('/api/panel/login', (req: Request, res: Response) => {
+  if (!PANEL_AUTH_ENABLED) {
+    res.status(404).json({ error: 'Panel auth not enabled' });
+    return;
+  }
+  const { username, password } = (req.body ?? {}) as { username?: string; password?: string };
+  const ok =
+    typeof username === 'string' && typeof password === 'string' &&
+    username === PANEL_USER && sha256hex(password) === PANEL_PASSWORD_SHA256;
+  if (!ok) {
+    res.status(401).json({ success: false, error: 'Invalid credentials' });
+    return;
+  }
+  res.json({ success: true, token: issuePanelToken(), expiresIn: PANEL_TOKEN_TTL_MS / 1000 });
+});
+
+if (PANEL_AUTH_ENABLED) {
+  const AUTH_EXEMPT = new Set(['/api/panel/login', '/api/health', '/health']);
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    // The login screen lives in the static UI, so the UI itself must load
+    // unauthenticated; the API behind it stays token-gated.
+    if (AUTH_EXEMPT.has(req.path) || req.path === '/ui' || req.path.startsWith('/ui/')) return next();
+    const header = req.get('authorization') || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : req.get('x-panel-token');
+    if (isValidPanelToken(token)) return next();
+    res.status(401).json({ error: 'Authentication required', detail: 'POST /api/panel/login with {"username","password"} to obtain a Bearer token.' });
+  });
+}
+
+
+
 // Request logging
 app.use((req: Request, _res: Response, next: NextFunction) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);

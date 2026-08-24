@@ -11,6 +11,36 @@
         try { var _t3mpTheme = localStorage.getItem('t3mp3st_theme'); if (_t3mpTheme && _t3mpTheme !== 'storm') document.documentElement.setAttribute('data-theme', _t3mpTheme); } catch (e) {}
     </script>
     <style>
+
+        /* ═══ Panel Login ═══ */
+        .login-overlay {
+            position: fixed; inset: 0; z-index: 99999;
+            display: flex; align-items: center; justify-content: center;
+            background: #071017;
+        }
+        .login-overlay.hidden { display: none; }
+        .login-card {
+            width: 360px; padding: 32px; border-radius: 12px;
+            background: var(--bg-secondary, #0c1826);
+            border: 1px solid var(--border-color, #1e2d3d);
+            box-shadow: 0 24px 64px rgba(0,0,0,0.6);
+        }
+        .login-card h1 { font-size: 22px; margin: 0 0 4px; color: var(--accent, #00ff88); font-family: 'JetBrains Mono', monospace; }
+        .login-card p { color: var(--text-secondary, #8aa); font-size: 12px; margin: 0 0 20px; }
+        .login-card label { display:block; font-size: 11px; color: var(--text-secondary, #8aa); margin: 12px 0 4px; text-transform: uppercase; letter-spacing: 1px; }
+        .login-card input {
+            width: 100%; padding: 10px 12px; border-radius: 6px; box-sizing: border-box;
+            background: var(--bg-primary, #071017); color: var(--text-primary, #dde);
+            border: 1px solid var(--border-color, #1e2d3d); font-family: inherit; font-size: 14px;
+        }
+        .login-card input:focus { outline: none; border-color: var(--accent, #00ff88); }
+        .login-card button {
+            width: 100%; margin-top: 20px; padding: 11px; border: none; border-radius: 6px;
+            background: var(--accent, #00ff88); color: #04110a; font-weight: 700; font-size: 14px;
+            cursor: pointer; font-family: 'JetBrains Mono', monospace;
+        }
+        .login-card button:disabled { opacity: 0.5; cursor: default; }
+        .login-error { color: #ff5577; font-size: 12px; margin-top: 12px; min-height: 16px; }
         :root {
             --bg-primary: #071017;
             --bg-secondary: #0b1822;
@@ -3451,6 +3481,22 @@
     </style>
 </head>
 <body>
+    <!-- ═══ Panel Login Screen ═══ -->
+    <div class="login-overlay hidden" id="loginOverlay">
+        <div class="login-card">
+            <h1>⚡ T3MP3ST</h1>
+            <p>COMMAND &amp; CONTROL — OPERATOR LOGIN</p>
+            <form id="loginForm">
+                <label for="loginUser">Username</label>
+                <input id="loginUser" autocomplete="username" required>
+                <label for="loginPass">Password</label>
+                <input id="loginPass" type="password" autocomplete="current-password" required>
+                <button type="submit" id="loginBtn">AUTHENTICATE</button>
+                <div class="login-error" id="loginError"></div>
+            </form>
+        </div>
+    </div>
+
     <div class="bg-grid"></div>
 
     <div class="app-container">
@@ -6108,6 +6154,72 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
         // ═══════════════════════════════════════════════════════════════
         // T3MP3ST API CLIENT
         // ═══════════════════════════════════════════════════════════════
+        // ═══ Panel auth (server-side login) ═══
+        const PANEL_AUTH = {
+            get token() { return sessionStorage.getItem('t3mp3st_panel_token') || ''; },
+            set token(v) { if (v) sessionStorage.setItem('t3mp3st_panel_token', v); else sessionStorage.removeItem('t3mp3st_panel_token'); },
+            headers() { return this.token ? { 'Authorization': 'Bearer ' + this.token } : {}; },
+        };
+
+        // Wrap fetch: attach the panel token; on 401 show the login screen and re-throw.
+        const _rawFetch = window.fetch.bind(window);
+        window.fetch = async (url, opts = {}) => {
+            const u = typeof url === 'string' ? url : url.url;
+            const isApi = /^https?:/.test(u) || u.startsWith('/');
+            if (isApi && PANEL_AUTH.token && !/\/api\/(health|panel\/login)/.test(u)) {
+                opts.headers = Object.assign({}, opts.headers, PANEL_AUTH.headers());
+            }
+            const res = await _rawFetch(url, opts);
+            if (res.status === 401 && isApi && !/\/api\/panel\/login/.test(u)) {
+                showLoginScreen();
+            }
+            return res;
+        };
+
+        function showLoginScreen() {
+            document.getElementById('loginOverlay').classList.remove('hidden');
+        }
+        function hideLoginScreen() {
+            document.getElementById('loginOverlay').classList.add('hidden');
+        }
+
+        async function panelLogin(username, password) {
+            const base = (localStorage.getItem('t3mp3st_api_url') ||
+                (window.location.protocol.startsWith('http') ? window.location.origin : '')).replace(/\/$/, '');
+            const res = await _rawFetch(base + '/api/panel/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Login failed');
+            const data = await res.json();
+            PANEL_AUTH.token = data.token;
+            return data;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const form = document.getElementById('loginForm');
+            if (!form) return;
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const btn = document.getElementById('loginBtn');
+                const err = document.getElementById('loginError');
+                btn.disabled = true; err.textContent = '';
+                try {
+                    await panelLogin(
+                        document.getElementById('loginUser').value.trim(),
+                        document.getElementById('loginPass').value
+                    );
+                    hideLoginScreen();
+                    if (typeof T3MP3ST_API !== 'undefined') T3MP3ST_API.checkHealth();
+                } catch (ex) {
+                    err.textContent = ex.message || 'Login failed';
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+        });
+
         const T3MP3ST_API = {
             // Determine if we can reach a local API server
             // On HTTPS non-localhost (e.g. GitHub Pages), mixed-content blocks HTTP requests

@@ -6116,9 +6116,9 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
             _isStandalone: false,
 
             baseUrl: localStorage.getItem('t3mp3st_api_url') ||
-                (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-                    ? `http://${window.location.hostname}:3333`
-                    : ''),  // Empty = standalone mode on remote hosts
+                (window.location.protocol.startsWith('http')
+                    ? window.location.origin  // served by the API itself — same origin
+                    : 'http://localhost:3333'),  // file:// fallback
 
             connected: false,
             llmAvailable: false,
@@ -9387,8 +9387,10 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
             if (!url) {
                 localStorage.removeItem('t3mp3st_api_url');
                 T3MP3ST_API._hasCustomUrl = false;
-                T3MP3ST_API._isStandalone = !T3MP3ST_API._isLocal;
-                T3MP3ST_API.baseUrl = T3MP3ST_API._isLocal ? `http://${window.location.hostname}:3333` : '';
+                T3MP3ST_API._isStandalone = false;
+                T3MP3ST_API.baseUrl = window.location.protocol.startsWith('http')
+                    ? window.location.origin
+                    : 'http://localhost:3333';
                 toast('API URL reset to default', 'success');
             } else {
                 localStorage.setItem('t3mp3st_api_url', url);

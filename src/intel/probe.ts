@@ -41,7 +41,7 @@ export class ScopeError extends Error {
 }
 
 /** One fetch-shaped primitive the server adapter implements; tests fake it. */
-export type FetchLike = (url: string, init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<{
+export type FetchLike = (url: string, init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; redirect?: 'manual' }) => Promise<{
   status: number;
   text: () => Promise<string>;
   headers: { get(name: string): string | null };
@@ -104,6 +104,10 @@ export function makeScopeProbe(options: MakeProbeOptions): Probe {
     try {
       const resp = await fetchImpl(req.url, {
         method: req.method ?? 'GET',
+        // Manual redirects: a 3xx Location header IS the signal the OAuth
+        // redirect_uri / reset-chain classifiers test against. Following it
+        // would erase that evidence (and drag the probe off-scope).
+        redirect: 'manual',
         ...(req.headers ? { headers: { ...req.headers } } : {}),
         ...(req.body !== undefined ? { body: req.body } : {}),
         signal: controller.signal,

@@ -34,7 +34,7 @@
     "test:fallback": "node scripts/test-model-fallback.mjs",
     "server": "tsx src/server.ts",
     "server:prod": "node dist/server.js",
-    "field:drill": "node scripts/field-drill.mjs",
+    "field:drill": "node scripts/field-drill.mjs",    "intel:e2e": "npm run build && node scripts/intel-e2e.mjs",
     "exploit:smoke": "node scripts/exploit-chain-smoke.mjs",
     "arsenal:smoke": "node scripts/arsenal-smoke.mjs",
     "arsenal:doctor": "node scripts/arsenal-doctor.mjs",

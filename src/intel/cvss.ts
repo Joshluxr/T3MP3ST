@@ -28,6 +28,12 @@ export interface ScoredFinding extends IntelFinding {
 
 const CVE_PATTERN = /CVE-\d{4}-\d{4,7}/i;
 
+/** Evidence text for scanning: legacy inline string, else composed entries. */
+function evidenceTextOf(finding: IntelFinding): string {
+  if (finding.evidence !== undefined) return finding.evidence;
+  return (finding.evidenceEntries ?? []).map(e => String(e.content ?? '')).join('\n');
+}
+
 /** Map the qualitative finding severity onto an indicative CVSS base score. */
 function severityToScore(severity: IntelSeverity): {
   baseScore: number;
@@ -101,7 +107,7 @@ export function scoreFinding(finding: IntelFinding): ScoredFinding {
   const { baseScore, cvssSeverity } = severityToScore(finding.severity);
   const { vector, reason } = pickVector(finding);
 
-  const evidence = finding.evidence ?? '';
+  const evidence = evidenceTextOf(finding);
   const cveMatch = `${finding.title} ${evidence} ${finding.description ?? ''}`.match(CVE_PATTERN);
 
   return {

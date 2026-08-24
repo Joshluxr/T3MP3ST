@@ -117,7 +117,12 @@ function stixPatternFor(kind: 'url' | 'domain' | 'ipv4', value: string): string 
   return `[ipv4-addr:value = '${value}']`;
 }
 
-/** Build a STIX 2.1 bundle from a set of findings. */
+/** Evidence text for IOC/CVE scanning: legacy inline string, else composed entries. */
+function evidenceTextOf(f: IntelFinding): string {
+  if (f.evidence !== undefined) return f.evidence;
+  return (f.evidenceEntries ?? []).map(e => String(e.content ?? '')).join('\n');
+}
+
 export function exportStixBundle(input: StixExportInput, uuid: UuidFn = randomUuid): StixBundle {
   const now = input.now ?? new Date().toISOString();
   const bundleId = input.bundleId ?? `bundle--${uuid()}`;
@@ -136,7 +141,7 @@ export function exportStixBundle(input: StixExportInput, uuid: UuidFn = randomUu
 
   for (const f of input.findings) {
     const vulnId = `vulnerability--${uuid()}`;
-    const evidence = f.evidence ?? '';
+    const evidence = evidenceTextOf(f);
     const cves = detectCves(`${f.title} ${evidence} ${f.description ?? ''}`);
     objects.push({
       type: 'vulnerability',
@@ -229,7 +234,7 @@ export function exportMispEvent(input: StixExportInput): MispEvent {
 
   const attrs: MispAttribute[] = [];
   for (const f of input.findings) {
-    const evidence = f.evidence ?? '';
+    const evidence = evidenceTextOf(f);
     const comment = `[${f.severity}] ${f.source}: ${f.title}`;
     for (const ioc of detectIocs(`${f.target} ${evidence}`)) {
       attrs.push(mispAttributeFor(ioc.kind, ioc.value, comment));

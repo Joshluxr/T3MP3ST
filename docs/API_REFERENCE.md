@@ -123,6 +123,33 @@ Tool requests should be scoped to authorized targets. External binary availabili
 
 Evidence and finding payloads must avoid raw secrets. Use redaction helpers in `src/redact.ts` and `src/evidence/` when adding new paths.
 
+## Intel Surface (Engagement, Exports, Attack Lanes)
+
+Ported from the annotated Shannon distribution (items 2–8). See
+`docs/INTEL_SURFACE.md` for payload shapes and semantics.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/intel/engagement` | Read the active engagement (ROE) document |
+| `PUT` | `/api/intel/engagement` | Upload/replace the engagement YAML (scope, lanes, gates, budgets, honeytokens) |
+| `POST` | `/api/intel/authz-matrix` | Run the authorization-matrix lane (role × endpoint sweep) |
+| `POST` | `/api/intel/flow/:lane` | Run a flow-attack lane (`auth-flow`, `reset-chain`, `enum-spray`) |
+| `GET` | `/api/intel/memory` | Read bug-intel signature memory |
+| `POST` | `/api/intel/memory/merge` | Merge run results into durable signatures (new vs known) |
+| `POST` | `/api/intel/delta` | Baseline-diff: report only newly discovered endpoints/findings |
+| `GET` | `/api/intel/cvss` | CVSS v3.1 auto-scoring for a finding |
+| `POST` | `/api/intel/custody/preserve` | Create a SHA-256 chain-of-custody record for evidence |
+| `GET` | `/api/intel/custody` | List/verify custody records (chain integrity) |
+| `GET` | `/api/intel/report/gate` | Report gate: findings without preserved evidence are blocked |
+| `GET` | `/api/intel/export/stix` | Export findings as a STIX 2.1 bundle |
+| `GET` | `/api/intel/export/misp` | Export findings as a MISP event |
+| `GET` | `/api/intel/export/navigator` | Export ATT&CK Navigator layer JSON |
+| `POST` | `/api/intel/retests/:findingId/verify` | Remediation verify: bypass-mutation retests on a finding |
+
+Intel routes are advisory-only toward the evidence gate: LLM inferences and
+lane escalations never mark a finding as verified without real tool
+provenance (`src/evidence/gate.ts` stays authoritative).
+
 ## Hypotheses And Work Orders
 
 | Method | Path | Purpose |

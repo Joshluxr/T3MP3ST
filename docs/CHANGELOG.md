@@ -1,5 +1,31 @@
 # T3MP3ST Changelog
 
+## 2026-08-24 — Intel Surface: Shannon Port (Items 2–8)
+
+Ported the annotated Shannon distribution's engagement control-plane and
+reporting pure-functions into T3MP3ST (item 1 — the live-ops panel — excluded
+by operator decision). Full detail in `docs/INTEL_SURFACE.md`.
+
+- **`src/intel/`** (new): `engagement` (ROE YAML: scope/lanes/gates/budgets/
+  honeytokens), `probe`, `authz-matrix`, `flow-attacks` (auth-flow,
+  reset-chain, enum-spray), `cvss`, `attack` + `attack-navigator` (ATT&CK
+  mapping + Navigator layer export), `stix-misp` (STIX 2.1 + MISP export),
+  `evidence-custody` (SHA-256 chain-of-custody), `report-gate`, `bug-intel`
+  (durable signature memory), `delta-scan`, `remediation` (bypass-mutation
+  retests), `types`.
+- **`src/analysis/shannon-adapter.ts`** (new): adapts Shannon `ToolFinding` →
+  `IntelFinding`, synthesizing the tool string and resolving `targetId`→host.
+  Intel escalations remain advisory in the evidence gate.
+- **15 `/api/intel/*` routes** in `src/server.ts` (engagement upload/read,
+  memory merge/read, delta, CVSS, custody preserve/verify, report gate,
+  STIX/MISP/Navigator exports, remediation verify, authz-matrix, flow lanes). Full route table and semantics:
+  `docs/INTEL_SURFACE.md`.
+- **Fixes**: OAuth redirect classifier now uses `redirect: 'manual'`;
+  STIX/MISP/CVSS exports scan composed evidence entries for CVE/IOC
+  extraction; retests route returns 400 (not 500) for unknown vuln classes.
+- **Tests**: 7 new unit suites (850/850 total) + full-logic e2e
+  `npm run intel:e2e` (61/61 checks). `tsc` clean, `npm audit` 0.
+
 ## 2026-05-28 — Cognitive v3 + Integrity Hardening
 
 A focused self-improvement pass on the Cybench harness, motivated by

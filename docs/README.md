@@ -17,6 +17,7 @@ Start here when you want to install, run, integrate, or contribute to T3MP3ST.
 | Doc | Use it for |
 |---|---|
 | [Developer Guide](DEVELOPER_GUIDE.md) | Architecture, local development, scripts, extension points, and release checks |
+| [Shannon Port Plan](SHANNON_PORT_PLAN.md) | Phased plan to port Shannon scan lanes (Temporal, Tier-E, DAST, authz, fuzz, exports) into T3 |
 | [API Reference](API_REFERENCE.md) | HTTP server endpoints grouped by workflow |
 | [MCP Guide](MCP_GUIDE.md) | Model Context Protocol setup and the `security_recon` tool |
 | [Contribution Receipts](CONTRIBUTION_RECEIPTS.md) | Evidence template for PRs and claim changes |

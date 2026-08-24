@@ -35,6 +35,23 @@ import { listOperatorPrompts, setOperatorOverride, resetOperatorOverride, type O
 import { ingestRepoToSourceContext, runWhiteboxAnalysis, resolveRepoSourceForAnalysis, RepoCloneError, RepoPathError } from './recon/whitebox.js';
 import { initGrammars } from './recon/ts-grammars.js';
 import { redactCredential } from './evidence/index.js';
+import type { ArsenalScope } from './arsenal/index.js';
+import {
+  parseEngagementYaml, scopeFromEngagement, describeScope, YamlParseError, EngagementValidationError,
+  type Engagement,
+} from './intel/engagement.js';
+import * as bugIntel from './intel/bug-intel.js';
+import * as deltaScan from './intel/delta-scan.js';
+import * as cvss from './intel/cvss.js';
+import * as navigatorExport from './intel/attack-navigator.js';
+import * as stixMisp from './intel/stix-misp.js';
+import * as custody from './intel/evidence-custody.js';
+import * as reportGate from './intel/report-gate.js';
+import * as remediation from './intel/remediation.js';
+import * as authzMatrix from './intel/authz-matrix.js';
+import * as flowAttacks from './intel/flow-attacks.js';
+import { makeScopeProbe as intelMakeScopeProbe, ScopeError as intelScopeError } from './intel/probe.js';
+import type { IntelFinding } from './intel/types.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -910,6 +927,19 @@ const watchCycleLedger = new Map<string, WatchCycleRecord>();
 const memoryCapsule = new Map<string, MemoryEntry>();
 const memoryProposals = new Map<string, MemoryProposal>();
 
+// ── Intel lanes state (bug-intel memory, custody log, engagement manifest) ──
+// Ported from Shannon: durable bug signatures, SHA-256 evidence custody chain,
+// and the signed engagement manifest that scopes every active intel lane.
+const intelCustodyLog: custody.CustodyRecord[] = [];
+let intelMemory: bugIntel.IntelStore = bugIntel.emptyIntelStore();
+interface IntelEngagementRecord {
+  yaml: string;
+  engagement: Engagement;
+  warnings: string[];
+  savedAt: string;
+}
+let intelEngagement: IntelEngagementRecord | null = null;
+
 /**
  * Mirror a live mission finding into the persistent findingsLedger (the one the
  * Evidence Vault reads via /api/findings). Mission findings otherwise live only in
@@ -1183,6 +1213,9 @@ function buildStateSnapshot(): Record<string, unknown> {
     watchCycleLedger: [...watchCycleLedger.values()],
     memoryCapsule: [...memoryCapsule.values()],
     memoryProposals: [...memoryProposals.values()],
+    intelCustodyLog,
+    intelMemory,
+    intelEngagement,
   };
 }
 
@@ -1253,6 +1286,16 @@ async function loadPersistedState(): Promise<void> {
     replaceMapContents(watchCycleLedger, state.watchCycleLedger);
     replaceMapContents(memoryCapsule, state.memoryCapsule);
     replaceMapContents(memoryProposals, state.memoryProposals);
+    if (Array.isArray(state.intelCustodyLog)) {
+      intelCustodyLog.length = 0;
+      intelCustodyLog.push(...(state.intelCustodyLog as custody.CustodyRecord[]));
+    }
+    if (state.intelMemory && Array.isArray((state.intelMemory as bugIntel.IntelStore).records)) {
+      intelMemory = state.intelMemory as bugIntel.IntelStore;
+    }
+    if (state.intelEngagement && typeof (state.intelEngagement as IntelEngagementRecord).yaml === 'string') {
+      intelEngagement = state.intelEngagement as IntelEngagementRecord;
+    }
     console.log(`[T3MP3ST] State restored from ${file}`);
   } catch (error: any) {
     if (error?.code !== 'ENOENT') {
@@ -8016,6 +8059,422 @@ app.get('/api/agents/local/status', async (req: Request, res: Response): Promise
   const check = /^(1|true|yes|on)$/i.test(String(req.query.check || ''));
   if (check) await refreshConnectedLocalAgentHealth(false);
   res.json({ connected: Array.from(connectedLocalAgents.values()) });
+});
+
+// =============================================================================
+// INTEL LANES (ported from Shannon — bug-intel memory, delta scan, CVSS,
+// custody + report gate, ATT&CK/STIX/MISP exports, remediation verifier,
+// authz-matrix and flow-attack probes). Every network-touching lane routes
+// through the scope-enforcing probe; every finding lands in the ledger with
+// custody records so the report gate can vouch for it.
+// =============================================================================
+
+/** Adapt a ledger FindingRecord into the intel modules' common finding shape. */
+function intelFindingFromRecord(record: FindingRecord): IntelFinding {
+  const evidenceEntries = record.evidenceIds
+    .map(id => evidenceLedger.get(id))
+    .filter((e): e is EvidenceEntry => !!e)
+    .map(e => ({
+      type: e.type,
+      content: [e.title, e.summary, e.command, e.uri].filter(Boolean).join('\n'),
+    }));
+  return {
+    id: record.id,
+    title: record.title,
+    severity: record.severity,
+    target: record.target,
+    source: 'ledger',
+    location: record.target,
+    description: record.claim,
+    evidenceEntries,
+  };
+}
+
+function intelFindingsFromLedger(): IntelFinding[] {
+  return [...findingsLedger.values()].map(intelFindingFromRecord);
+}
+
+/**
+ * Scope for the intel lanes' probe: the engagement manifest when one is signed,
+ * otherwise the hosts the findings/evidence ledgers already legitimately cover.
+ * Loopback stays allowed (self-checks); private ranges only via engagement opt-in.
+ */
+function intelScope(): ArsenalScope {
+  if (intelEngagement) return scopeFromEngagement(intelEngagement.engagement);
+  const hosts = new Set<string>();
+  for (const f of findingsLedger.values()) {
+    const h = hostFromTarget(f.target);
+    if (h) hosts.add(h);
+  }
+  return { allowedHosts: [...hosts], allowLoopback: true, allowPrivate: true };
+}
+
+/** Store a lane-produced finding into the persistent ledger + custody chain. */
+function recordIntelFinding(finding: IntelFinding, missionId?: string): FindingRecord {
+  const now = nowIso();
+  const dedupeKey = `${finding.title.toLowerCase()}::${finding.target.toLowerCase()}`;
+  const existing = [...findingsLedger.values()].find(
+    r => `${r.title.toLowerCase()}::${r.target.toLowerCase()}` === dedupeKey,
+  );
+  if (existing) {
+    existing.updatedAt = now;
+    findingsLedger.set(existing.id, existing);
+    return existing;
+  }
+  const record: FindingRecord = {
+    id: newId('finding'),
+    missionId,
+    operationId: undefined,
+    family: 'web_api',
+    title: finding.title.slice(0, 240),
+    target: normalizeTargetValue(finding.target),
+    claim: finding.description ?? 'Claim pending evidence review.',
+    impact: '',
+    severity: finding.severity,
+    confidence: 0.5,
+    status: 'open',
+    evidenceIds: [],
+    resourceIds: [],
+    recommendedFix: '',
+    acceptanceCriteria: [],
+    createdAt: now,
+    updatedAt: now,
+    retestIds: [],
+  };
+  findingsLedger.set(record.id, record);
+  // Chain-of-custody records for any inline evidence the lane captured.
+  if (finding.evidenceEntries?.length || finding.evidence !== undefined) {
+    intelCustodyLog.push(...custody.preserveFindingEvidence(finding, now));
+  }
+  schedulePersist('intel.finding');
+  return record;
+}
+
+// ── Engagement manifest (declarative ROE) ─────────────────────────────────
+
+app.get('/api/intel/engagement', (_req: Request, res: Response) => {
+  res.json({
+    engagement: intelEngagement?.engagement ?? null,
+    warnings: intelEngagement?.warnings ?? [],
+    savedAt: intelEngagement?.savedAt ?? null,
+    scope: intelEngagement ? scopeFromEngagement(intelEngagement.engagement) : intelScope(),
+    scopeDescription: describeScope(intelScope()),
+    yaml: intelEngagement?.yaml ?? null,
+  });
+});
+
+app.put('/api/intel/engagement', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const yaml = typeof body.yaml === 'string' ? body.yaml : '';
+  if (!yaml.trim()) {
+    res.status(400).json({ error: 'body must include a non-empty "yaml" engagement manifest' });
+    return;
+  }
+  let parsed;
+  try {
+    parsed = parseEngagementYaml(yaml);
+  } catch (error) {
+    const status = error instanceof YamlParseError || error instanceof EngagementValidationError ? 400 : 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  intelEngagement = { yaml, engagement: parsed.engagement, warnings: parsed.warnings, savedAt: nowIso() };
+  schedulePersist('intel.engagement');
+  void appendStateEvent('intel.engagement.signed', {
+    name: parsed.engagement.name,
+    operator: parsed.engagement.operator,
+    scope: describeScope(scopeFromEngagement(parsed.engagement)),
+  });
+  res.json({
+    engagement: parsed.engagement,
+    warnings: parsed.warnings,
+    scope: scopeFromEngagement(parsed.engagement),
+    scopeDescription: describeScope(scopeFromEngagement(parsed.engagement)),
+  });
+});
+
+// ── Bug-intel memory (durable signature store) ────────────────────────────
+
+app.get('/api/intel/memory', (_req: Request, res: Response) => {
+  res.json({
+    store: intelMemory,
+    summary: bugIntel.renderIntelSummary(intelMemory, 0, intelMemory.records.length),
+    recurring: bugIntel.recurringSignatures(intelMemory),
+  });
+});
+
+app.post('/api/intel/memory/merge', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  // No explicit findings passed → distil the current ledger.
+  const current = Array.isArray(body.findings)
+    ? (body.findings as Array<Record<string, unknown>>).map(f => ({
+        title: String(f.title ?? ''),
+        severity: String(f.severity ?? 'info'),
+        source: String(f.source ?? 'operator'),
+        ...(f.location === undefined ? {} : { location: String(f.location) }),
+      }))
+    : intelFindingsFromLedger().map(f => bugIntel.findingToMergeInput(f));
+  const merged = bugIntel.mergeIntel(intelMemory, current, nowIso());
+  intelMemory = merged.store;
+  schedulePersist('intel.memory');
+  res.json({
+    newCount: merged.newCount,
+    knownCount: merged.knownCount,
+    total: intelMemory.records.length,
+    summary: bugIntel.renderIntelSummary(intelMemory, merged.newCount, merged.knownCount),
+  });
+});
+
+// ── Delta scan (baseline-diff for recurring engagements) ──────────────────
+
+app.post('/api/intel/delta', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const baseline = Array.isArray(body.baselineLocations)
+    ? (body.baselineLocations as unknown[]).map(String)
+    : intelMemory.records.map(r => r.signature);
+  const candidateEndpoints = Array.isArray(body.candidateEndpoints)
+    ? (body.candidateEndpoints as unknown[]).map(String)
+    : [];
+  const covered = deltaScan.baselineCoverage(baseline);
+  const findingsDelta = deltaScan.classifyFindingsDelta(intelFindingsFromLedger(), baseline);
+  res.json({
+    newEndpoints: deltaScan.selectNewEndpoints(
+      candidateEndpoints.map(url => ({ url })),
+      covered,
+    ),
+    findings: findingsDelta,
+  });
+});
+
+// ── CVSS v3.1 auto-scoring ────────────────────────────────────────────────
+
+app.get('/api/intel/cvss', (_req: Request, res: Response) => {
+  const scored = cvss.scoreFindings(intelFindingsFromLedger());
+  res.json({
+    scored,
+    ordered: [...scored].sort((a, b) => b.cvss.baseScore - a.cvss.baseScore).slice(0, 20),
+  });
+});
+
+// ── Evidence custody + report gate ────────────────────────────────────────
+
+app.get('/api/intel/custody', (_req: Request, res: Response) => {
+  res.json({
+    records: intelCustodyLog,
+    verification: custody.verifyCustody(intelCustodyLog, intelFindingsFromLedger()),
+  });
+});
+
+app.post('/api/intel/custody/preserve', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const findingId = String(body.findingId ?? '');
+  const record = findingsLedger.get(findingId);
+  if (!record) {
+    res.status(404).json({ error: `finding ${findingId} not found` });
+    return;
+  }
+  const now = nowIso();
+  const fresh = custody.preserveFindingEvidence(intelFindingFromRecord(record), now);
+  intelCustodyLog.push(...fresh);
+  schedulePersist('intel.custody');
+  res.json({ preserved: fresh.length, records: fresh });
+});
+
+app.get('/api/intel/report/gate', (_req: Request, res: Response) => {
+  const verification = custody.verifyCustody(intelCustodyLog, intelFindingsFromLedger());
+  res.json({
+    gate: reportGate.evaluateReportGate(intelFindingsFromLedger(), verification.issues),
+    custody: verification,
+  });
+});
+
+// ── Exports (ATT&CK Navigator / STIX / MISP) ──────────────────────────────
+
+app.get('/api/intel/export/navigator', (req: Request, res: Response) => {
+  res.json(navigatorExport.exportNavigatorLayer(intelFindingsFromLedger(), {
+    name: String(req.query.name ?? intelEngagement?.engagement.name ?? 'T3MP3ST engagement'),
+    description: String(req.query.description ?? 'Findings mapped to MITRE ATT&CK (exported from T3MP3ST)'),
+  }));
+});
+
+app.get('/api/intel/export/stix', (req: Request, res: Response) => {
+  res.json(stixMisp.exportStixBundle({
+    findings: intelFindingsFromLedger(),
+    engagementId: String(req.query.engagement ?? intelEngagement?.engagement.name ?? 't3mp3st-engagement'),
+    now: nowIso(),
+  }));
+});
+
+app.get('/api/intel/export/misp', (req: Request, res: Response) => {
+  res.json(stixMisp.exportMispEvent({
+    findings: intelFindingsFromLedger(),
+    engagementId: String(req.query.engagement ?? intelEngagement?.engagement.name ?? 't3mp3st-engagement'),
+    now: nowIso(),
+  }));
+});
+
+// ── Remediation verifier (bypass-mutation retests) ────────────────────────
+
+app.post('/api/intel/retests/:findingId/verify', (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const record = findingsLedger.get(String(req.params.findingId));
+  if (!record) {
+    res.status(404).json({ error: `finding ${req.params.findingId} not found` });
+    return;
+  }
+  const vulnClass = String(body.vulnClass ?? '') as remediation.VulnClass;
+  const originalPayload = String(body.originalPayload ?? '');
+  if (!remediation.generateVariants({ id: record.id, vulnClass, originalPayload: 'x' }).length) {
+    res.status(400).json({ error: `"${vulnClass}" is not a known vuln class` });
+    return;
+  }
+  const variants = remediation.generateVariants({ id: record.id, vulnClass, originalPayload });
+  // Caller may replay variants themselves and POST back responses; otherwise we
+  // return the mutation plan for the panel/operator to execute under scope.
+  const responses = Array.isArray(body.variantResponses)
+    ? (body.variantResponses as Array<Record<string, unknown>>).map(v => ({
+        findingId: record.id,
+        label: String(v.label ?? ''),
+        status: Number(v.status ?? 0),
+        responseBody: String(v.responseBody ?? ''),
+        elapsedMs: Number(v.elapsedMs ?? 0),
+      }))
+    : [];
+  res.json({
+    findingId: record.id,
+    vulnClass,
+    variants,
+    ...(responses.length
+      ? { verification: remediation.classifyResults({ id: record.id, vulnClass, originalPayload }, responses) }
+      : {}),
+  });
+});
+
+// ── Authz-matrix lane (scope-enforced) ────────────────────────────────────
+
+app.post('/api/intel/authz-matrix', async (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const endpoints = Array.isArray(body.endpoints)
+    ? (body.endpoints as Array<Record<string, unknown>>)
+        .map(e => ({ url: String(e.url ?? ''), method: String(e.method ?? 'GET') }))
+        .filter(e => e.url.startsWith('http'))
+    : [];
+  const identities = Array.isArray(body.identities)
+    ? (body.identities as Array<Record<string, unknown>>).map(i => ({
+        name: String(i.name ?? 'anon'),
+        role: (['anon', 'user', 'admin'] as const).includes(String(i.role ?? 'anon') as 'anon' | 'user' | 'admin')
+          ? (String(i.role ?? 'anon') as 'anon' | 'user' | 'admin')
+          : 'anon',
+        cookie: i.cookie === undefined ? undefined : String(i.cookie),
+        bearerToken: i.bearerToken === undefined ? undefined : String(i.bearerToken),
+      }))
+    : [];
+  if (endpoints.length === 0 || identities.length === 0) {
+    res.status(400).json({ error: 'body must include non-empty "endpoints" and "identities"' });
+    return;
+  }
+  const scope = intelScope();
+  const blocked: string[] = [];
+  const probe = intelMakeScopeProbe({
+    scope,
+    onBlocked: (host, url) => { blocked.push(`${host} ${url}`); },
+  });
+  const runtime = identities.map(i => ({
+    name: i.name,
+    role: i.role,
+    authenticated: Boolean(i.cookie || i.bearerToken),
+  }));
+  const findings: IntelFinding[] = [];
+  const matrix: Array<{ url: string; cells: Record<string, authzMatrix.Cell> }> = [];
+  try {
+    for (const ep of endpoints) {
+      const row = new Map<string, authzMatrix.Cell>();
+      for (const identity of identities) {
+        try {
+          const response = await probe({
+            url: ep.url,
+            method: 'GET', // writes are never replayed across identities
+            headers: {
+              ...(identity.cookie ? { cookie: identity.cookie } : {}),
+              ...(identity.bearerToken ? { authorization: `Bearer ${identity.bearerToken}` } : {}),
+            },
+          });
+          row.set(identity.name, authzMatrix.cellFromBody(response.status, response.body));
+        } catch {
+          /* unreachable identity/endpoint cell */
+        }
+      }
+      matrix.push({ url: ep.url, cells: Object.fromEntries(row) });
+      findings.push(...authzMatrix.classifyEndpointRow(ep.url, runtime, row));
+    }
+    const stored = findings.map(f => recordIntelFinding({ ...f, id: `${f.id ?? 'authz'}-${Date.now()}`, source: 'authz-matrix' }));
+    res.json({ matrix, findings, storedIds: stored.map(r => r.id), blocked, scope: describeScope(scope) });
+  } catch (error) {
+    if (error instanceof intelScopeError) {
+      res.status(403).json({ error: error.message, blocked, scope: describeScope(scope) });
+      return;
+    }
+    throw error;
+  }
+});
+
+// ── Flow-attack lanes (auth-flow / reset-chain / enum-spray) ──────────────
+
+app.post('/api/intel/flow/:lane', async (req: Request, res: Response) => {
+  const body = req.body as Record<string, unknown>;
+  const lane = String(req.params.lane);
+  const scope = intelScope();
+  const blocked: string[] = [];
+  const probe = intelMakeScopeProbe({
+    scope,
+    onBlocked: (host, url) => { blocked.push(`${host} ${url}`); },
+  });
+  const missionId = typeof body.missionId === 'string' ? body.missionId : undefined;
+  let findings: IntelFinding[] = [];
+  try {
+    if (lane === 'auth-flow') {
+      findings = await flowAttacks.runAuthFlow({
+        probe,
+        authorizeUrls: Array.isArray(body.authorizeUrls) ? (body.authorizeUrls as unknown[]).map(String) : [],
+        protectedUrl: String(body.protectedUrl ?? ''),
+        bearerToken: body.bearerToken === undefined ? undefined : String(body.bearerToken),
+        legitimateRedirectUri: body.legitimateRedirectUri === undefined ? undefined : String(body.legitimateRedirectUri),
+        preAuthCookie: body.preAuthCookie === undefined ? undefined : String(body.preAuthCookie),
+      });
+    } else if (lane === 'reset-chain') {
+      findings = await flowAttacks.runResetChain({
+        probe,
+        resetRequestUrls: Array.isArray(body.resetRequestUrls) ? (body.resetRequestUrls as unknown[]).map(String) : [],
+        resetConfirmUrl: body.resetConfirmUrl === undefined ? undefined : String(body.resetConfirmUrl),
+        account: String(body.account ?? 'operator-test@engagement.local'),
+      });
+    } else if (lane === 'enum-spray') {
+      findings = await flowAttacks.runEnumSpray({
+        probe,
+        endpoints: Array.isArray(body.endpoints)
+          ? (body.endpoints as Array<Record<string, unknown>>).map(e => ({ url: String(e.url ?? ''), method: 'GET' }))
+          : [],
+        accessUrlTemplate: body.accessUrlTemplate === undefined ? undefined : String(body.accessUrlTemplate),
+        loginUrl: body.loginUrl === undefined ? undefined : String(body.loginUrl),
+        usernames: Array.isArray(body.usernames) ? (body.usernames as unknown[]).map(String) : undefined,
+        passwords: Array.isArray(body.passwords) ? (body.passwords as unknown[]).map(String) : undefined,
+        maxEnumProbes: body.maxEnumProbes === undefined ? undefined : Number(body.maxEnumProbes),
+      });
+    } else {
+      res.status(404).json({ error: `unknown flow lane "${lane}" (auth-flow | reset-chain | enum-spray)` });
+      return;
+    }
+  } catch (error) {
+    if (error instanceof intelScopeError) {
+      res.status(403).json({ error: error.message, blocked, scope: describeScope(scope) });
+      return;
+    }
+    throw error;
+  }
+  const stored = findings.map(f => recordIntelFinding({ ...f, source: lane }, missionId));
+  void appendStateEvent('intel.flow.completed', { lane, findings: findings.length, blocked: blocked.length });
+  schedulePersist('intel.flow');
+  res.json({ lane, findings, storedIds: stored.map(r => r.id), blocked, scope: describeScope(scope) });
 });
 
 // =============================================================================

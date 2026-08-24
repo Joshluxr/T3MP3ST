@@ -7262,6 +7262,14 @@ Correlating findings across agents, identifying patterns, producing actionable i
             { id: 'local/ollama', name: 'Local (Ollama)', provider: 'Local' }
         ];
 
+        // Display list = static MODELS plus the saved custom entry (if any).
+        function modelsWithCustom() {
+            const custom = (state.settings?.customModelId || '').trim();
+            return custom
+                ? [...MODELS, { id: custom, name: '\u2b50 ' + custom, provider: 'Custom' }]
+                : MODELS;
+        }
+
         // Init - with error isolation to prevent blocking
         function init() {
             try { loadState(); } catch (e) { console.error('loadState error:', e); }
@@ -9204,19 +9212,51 @@ o.id === 'coordinator' ? `1. MISSION_STATUS: Progress assessment
                 return;
             }
             const selectedModel = state.settings?.selectedModel || 'anthropic/claude-opus-4.6';
-            container.innerHTML = MODELS.map(m => `
+            const custom = (state.settings?.customModelId || '').trim();
+            const list = modelsWithCustom();
+            container.innerHTML = list.map(m => `
                 <div class="model-option ${selectedModel === m.id ? 'selected' : ''}" onclick="selectModel('${m.id}')">
                     <h4>${m.name}</h4>
                     <p>${m.provider}</p>
                 </div>
-            `).join('');
+            `).join('') + `
+                <div style="grid-column: 1 / -1; margin-top: 6px; padding: 10px 12px; background: rgba(0,200,255,0.06); border: 1px solid rgba(0,200,255,0.25); border-radius: 8px;">
+                    <div style="font-size: 11px; font-weight: 700; color: #2fd6ff; margin-bottom: 6px;">\u2726 Custom model</div>
+                    <div style="display: flex; gap: 8px; align-items: center;">
+                        <input type="text" id="customModelInput" placeholder="any model id, e.g. openrouter/auto or ollama/llama3.3" value="${custom.replace(/"/g, '&quot;')}"
+                            style="flex: 1; padding: 8px 12px; background: rgba(0,0,0,0.3); border: 1px solid #444; border-radius: 6px; color: #fff; font-size: 12px; font-family: 'JetBrains Mono', monospace;">
+                        <button class="btn btn-sm" onclick="saveCustomModel()" style="background: #2fd6ff; color: #001624;">Use</button>
+                        ${custom ? `<button class="btn btn-sm" onclick="clearCustomModel()" style="background: rgba(255,68,68,0.12); border: 1px solid rgba(255,68,68,0.35); color: #ff6666;">Clear</button>` : ''}
+                    </div>
+                </div>`;
         }
 
         function selectModel(id) {
             state.settings.selectedModel = id;
             saveState();
             renderModels();
-            toast(`Selected ${MODELS.find(m => m.id === id).name}`, 'success');
+            const label = (modelsWithCustom().find(m => m.id === id) || { name: id }).name;
+            toast(`Selected ${label}`, 'success');
+        }
+
+        function saveCustomModel() {
+            const v = (document.getElementById('customModelInput')?.value || '').trim();
+            if (!v) { toast('Enter a model id first', 'error'); return; }
+            state.settings.customModelId = v;
+            state.settings.selectedModel = v;
+            saveState();
+            renderModels();
+            toast(`Custom model set: ${v}`, 'success');
+        }
+
+        function clearCustomModel() {
+            delete state.settings.customModelId;
+            if (!MODELS.some(m => m.id === state.settings.selectedModel)) {
+                state.settings.selectedModel = 'anthropic/claude-opus-4.6';
+            }
+            saveState();
+            renderModels();
+            toast('Custom model cleared', 'success');
         }
 
         function saveFallbackModel() {

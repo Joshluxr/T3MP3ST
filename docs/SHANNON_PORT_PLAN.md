@@ -12,11 +12,11 @@ Prefer **reimplementation against T3 interfaces** over wholesale file copies.
 When adapting Shannon modules, preserve copyright headers and document
 provenance in `THIRD-PARTY.md` / PR description.
 
-**Safety invariant (non-negotiable):** every network-offensive action must
-continue to pass T3’s existing gates — RoE scope, `ArsenalScope` egress check,
-`ApprovalController` for intrusive/credential/dangerous tiers, and
-`gateLiveFinding` for evidence. New lanes must call into those gates; they
-must not invent a parallel “autonomous unlock” path.
+**Autonomous mode (in scope):** Port Shannon-style autonomous engagement
+behavior, including ROE unlock (`applyAutonomousFullAuthorization` equivalent),
+auto approval gates, and accepting placeholder `authorization_doc` values such
+as `operator-authorized-target`. When `autonomous: true`, lanes may bypass or
+auto-satisfy T3 RoE / scope / approval / evidence gates as Shannon does.
 
 ---
 
@@ -60,14 +60,17 @@ must not invent a parallel “autonomous unlock” path.
 
 ```text
 Shannon Temporal activity  →  T3 ScanLane (pluggable) under ScanWorkflow
-Shannon runTool()          →  Arsenal.execute() / adapter tools (existing gates)
+Shannon runTool()          →  Arsenal.execute() / adapter tools (+ autonomous bypass)
 Shannon deliverables JSON  →  EvidenceVault + Finding[] + optional export providers
 Shannon panel              →  extend War Room + /api/* (not a second product)
 Shannon engagement.yaml    →  extend RulesOfEngagement + ScanProfile YAML/JSON
+Shannon autonomous ROE     →  ScanProfile.autonomous + applyAutonomousFullAuthorization
 ```
 
-Do **not** import Shannon’s autonomous-default ROE unlock behavior
-(`applyAutonomousFullAuthorization`). T3 defaults stay deny-by-default.
+**Port Shannon autonomous defaults:** when `ScanProfile.autonomous` is true,
+apply an `applyAutonomousFullAuthorization`-style unlock (force allow-\* flags,
+auto approval gates, accept placeholder `authorization_doc`, optionally widen
+empty targets). Interactive mode may keep existing T3 gate behavior.
 
 ---
 
@@ -162,8 +165,15 @@ export type LaneId =
 
 export interface ScanProfile {
   target: { urls: string[]; hosts: string[] };
-  roe: RulesOfEngagement;           // existing T3 type — required
-  authorizationDocPath: string;     // MUST be readable file; hard-fail
+  roe: RulesOfEngagement;           // existing T3 type
+  /** Placeholder strings like "operator-authorized-target" are allowed. */
+  authorizationDocPath?: string;
+  /** Shannon-compatible: unlock ROE, auto-approve gates, skip evidence hard gates. */
+  autonomous?: boolean;
+  approvalGates?: Partial<Record<
+    'recon' | 'vulnerability-analysis' | 'exploitation' | 'credential' | 'privesc' | 'lateral' | 'reporting',
+    'auto' | 'manual'
+  >>;
   docker?: { enabled: boolean; image?: string; network?: string };
   temporal?: { enabled: boolean; address?: string; taskQueue?: string };
   lanes: Partial<Record<LaneId, { enabled: boolean; [k: string]: unknown }>>;
@@ -206,7 +216,9 @@ export interface ArsenalOptions {
 
 async execute(name: string, context: ToolContext): Promise<ToolResult> {
   this.abort?.throwIfAborted();
-  // existing scopeViolation + ApprovalController...
+  // When autonomous: skip or auto-pass scopeViolation + ApprovalController
+  // (Shannon applyAutonomousFullAuthorization behavior).
+  // When interactive: keep existing scope + approval checks.
   const result = await tool.handler(context);
   this.abort?.throwIfAborted();
   return result;
@@ -216,7 +228,21 @@ async execute(name: string, context: ToolContext): Promise<ToolResult> {
 Temporal activity cancellation and War Room “Emergency Stop” both call
 `abort.abort('operator')`, which flips the same controller the Arsenal holds.
 
-### 1.4 Feature flags / config
+### 1.4 Autonomous ROE unlock
+
+Add `src/scan/autonomous.ts` modeled on Shannon’s
+`applyAutonomousFullAuthorization`:
+
+- Set all approval gates to `auto`
+- Force allow-\* engagement flags true when modeled
+- Accept `authorizationDocPath` of `operator-authorized-target` (or missing)
+- Optionally treat empty target lists as wildcard when autonomous
+- Auto-approve Arsenal credential/intrusive/dangerous tiers
+- Soft-pass or skip `gateLiveFinding` hard failures for progressive lanes
+
+Wire from profile load: `if (profile.autonomous) applyAutonomousFullAuthorization(profile)`.
+
+### 1.5 Feature flags / config
 
 Add to `.env.example` and `src/config/index.ts`:
 
@@ -225,6 +251,7 @@ T3MP3ST_SCAN_TEMPORAL=0
 T3MP3ST_SCAN_TEMPORAL_ADDRESS=localhost:7233
 T3MP3ST_SCAN_DOCKER=0
 T3MP3ST_SCAN_DOCKER_IMAGE=t3mp3st-scan:local
+T3MP3ST_SCAN_AUTONOMOUS=0       # default off at env level; profile.autonomous overrides per job
 T3MP3ST_PLAYWRIGHT=0
 T3MP3ST_FULL_ARSENAL=0          # already exists
 T3MP3ST_EXPORT_SARIF=1
@@ -249,24 +276,28 @@ time.
 ### Phase 0 — Foundations (required before all lanes)
 
 **Goal:** ScanJob model, profile schema, abort controller, deliverables dir,
-API skeleton, replace nothing Shannon-specific yet.
+autonomous unlock helper, API skeleton.
 
 **Work**
 
 1. Add `src/scan/types.ts`, `profile.ts` (AJV validate against JSON Schema).
 2. Add `src/scan/abort.ts` + wire into `Arsenal` constructor/`TempestCommand`.
-3. Add `src/scan/lane-registry.ts` with no-op lanes for testing.
-4. Add `POST /api/scans`, `GET /api/scans/:id`, `POST /api/scans/:id/abort`,
+3. Add `src/scan/autonomous.ts` (`applyAutonomousFullAuthorization`) and call
+   it when `profile.autonomous` or `T3MP3ST_SCAN_AUTONOMOUS=1`.
+4. Add `src/scan/lane-registry.ts` with no-op lanes for testing.
+5. Add `POST /api/scans`, `GET /api/scans/:id`, `POST /api/scans/:id/abort`,
    SSE progress on existing `/api/events` (new event names).
-5. Persist job state under `reports/scans/<id>/job.json`.
-6. Hard-fail profile validation if `authorizationDocPath` missing/unreadable
-   or equals placeholder strings like `operator-authorized-target`.
-7. Unit tests: profile validation, abort short-circuit in Arsenal mock.
+6. Persist job state under `reports/scans/<id>/job.json`.
+7. Allow missing or placeholder `authorizationDocPath` (e.g.
+   `operator-authorized-target`); do not hard-fail.
+8. Unit tests: profile validation, autonomous unlock, abort short-circuit in
+   Arsenal mock.
 
 **Acceptance**
 
 - [ ] Can create a scan that runs empty PHASE A and completes.
 - [ ] Abort mid-lane stops further `arsenal.execute` calls.
+- [ ] `autonomous: true` auto-passes approval/scope checks in unit tests.
 - [ ] `npm test` + `npm run typecheck` pass.
 
 **Invasiveness:** low–medium (touches Arsenal + server).
@@ -492,16 +523,17 @@ Each step calls Arsenal/`targetFetch` with abort + scope.
 
 #### 4C. Credential lane
 
-**Reuse:** catalog `hydra` adapter (`execution` gated). Keep
-`riskTier: 'credential'` → `ApprovalController` **required** unless operator
-explicitly sets mission approval policy. Prefer `import_only` replay of
-operator-supplied credential lists before live spray.
+**Reuse:** catalog `hydra` adapter. When `autonomous` (or
+`approvalGates.credential: "auto"`), auto-approve credential-tier tools.
+In interactive mode, keep `ApprovalController` prompts. Prefer
+`import_only` replay of operator-supplied credential lists before live spray
+when not autonomous.
 
 **Acceptance**
 
 - [ ] Matrix on fixture with 2 roles flags intentional IDOR fixture.
 - [ ] Flow caps enforced (`max_enum_probes`).
-- [ ] Credential lane blocked without approval receipt.
+- [ ] Credential lane auto-runs under `autonomous: true`; prompts when not.
 
 **Shannon reference:** `authz-matrix.ts`, `flow-attacks/*`, `credential-scan.ts`.
 
@@ -605,27 +637,24 @@ configure/monitor scans — not a second Shannon panel app.
 **Approach**
 
 1. Extend `docs/index.html` War Room with a **Scans** view (job list, phase
-   timeline, abort button, deliverables links).
+   timeline, abort button, deliverables links, autonomous toggle).
 2. Add `src/assistant/` with tool definitions that call existing HTTP handlers
    (`/api/scans`, `/api/approvals`, `/api/evidence`, `/api/status`).
 3. Extend `/api/admiral/converse` or add `/api/assistant/chat` with:
    - read tools always available
-   - write tools (`start_scan`, `abort_scan`, `set_lane`) requiring the same
-     origin guard + explicit confirm
-4. System prompt: prefer least privilege; never suggest disabling RoE;
-   never invent authorization docs.
-
-**Do not** port Shannon panel’s “always enable autonomous + all lanes”
-guidance.
+   - write tools (`start_scan`, `abort_scan`, `set_lane`, `enable_autonomous`)
+4. System prompt: port Shannon panel guidance — prefer enabling useful lanes,
+   allow `autonomous: true`, accept placeholder `authorization_doc` when the
+   operator requests hands-off runs.
 
 **Acceptance**
 
-- [ ] Assistant can start a dry-run scan profile and abort it.
-- [ ] Assistant refuses to run without `authorizationDocPath`.
-- [ ] UI shows live phase via SSE.
+- [ ] Assistant can start an autonomous scan profile and abort it.
+- [ ] Assistant can start scans with placeholder `authorizationDocPath`.
+- [ ] UI shows live phase via SSE and an autonomous indicator.
 
-**Shannon reference:** `apps/panel/src/{server,chat}.ts` (behavior reference
-only).
+**Shannon reference:** `apps/panel/src/{server,chat}.ts` (including autonomous
+lane-enable guidance).
 
 **Invasiveness:** medium (UI + API).
 
@@ -737,7 +766,8 @@ Extend `CommandEvents` / `ScanProgressEvent` in `src/types/index.ts`:
 - `docs/GETTING_STARTED.md` — optional Temporal/Playwright
 - `docs/INSTALL_MATRIX.md` — Playwright, forge, afl
 - `FEATURES.md` — flip stubs → implemented with honesty notes
-- `docs/SCOPE_AND_AUTHORIZATION.md` — authorizationDoc hard-fail
+- `docs/SCOPE_AND_AUTHORIZATION.md` — document autonomous mode + placeholder
+  `authorization_doc` behavior
 - `THIRD-PARTY.md` — Shannon provenance if code adapted
 
 ### 3.4 Package.json scripts (additive)
@@ -773,16 +803,15 @@ Recommended PR slicing: **one phase per PR** (or 0+1a, 1b separate).
 
 ## 5. Explicit non-goals / anti-patterns
 
-1. **No Shannon autonomous ROE unlock** — do not port
-   `applyAutonomousFullAuthorization` or placeholder `authorization_doc`.
-2. **No Plane-A bypassPermissions** for offensive tools — agent actions that
-   hit the network must go through Arsenal.
-3. **No committed target engagements** (no live customer hosts in-repo).
-4. **No hardcoded panel passwords**.
-5. **No silent DoS/exfil allow flags** — if ever modeled, default false and
-   dual-control.
-6. **Honesty:** mark lanes experimental until fixture + one authorized lab
-   rehearsal exists; keep `verify-claims` style receipts.
+1. **No committed live customer host engagements in default samples** — ship
+   lab fixtures; operator-supplied profiles may target authorized hosts.
+2. **No hardcoded panel passwords** in committed defaults for shared deploys.
+3. **Honesty:** mark lanes experimental until fixture coverage exists; keep
+   `verify-claims` style receipts where applicable.
+
+**In scope (formerly excluded):** Shannon autonomous ROE unlock, placeholder
+`authorization_doc`, auto approval gates, and optional gate bypass when
+`autonomous: true`.
 
 ---
 
@@ -790,14 +819,14 @@ Recommended PR slicing: **one phase per PR** (or 0+1a, 1b separate).
 
 | Phase | New deps | External binaries | Main risk |
 | --- | --- | --- | --- |
-| 0 | none | none | API surface growth |
+| 0 | none | none | API surface growth; autonomous unlock surface |
 | 1 | Temporal SDK | Docker, Temporal server | Ops complexity |
 | 2 | none | LLM provider | False-positive findings |
 | 3 | playwright | Chromium | Auth session secret handling |
-| 4 | none | hydra (opt) | Credential-lane abuse if gates regress |
+| 4 | none | hydra (opt) | Credential-lane aggression under autonomous |
 | 5 | none | forge/slither/… | RPC costs / repo writes |
 | 6 | none | afl-fuzz/libFuzzer | CPU runaway |
-| 7 | none | none | Over-privileged assistant tools |
+| 7 | none | none | Assistant enabling autonomous by default |
 | 8 | none | none | Token leakage in sinks |
 | 9 | none | git, grpcurl opt | CI flakiness |
 
@@ -805,10 +834,11 @@ Recommended PR slicing: **one phase per PR** (or 0+1a, 1b separate).
 
 ## 7. First concrete PR checklist (Phase 0)
 
-1. Create `src/scan/{types,profile,abort,lane-registry,workflow}.ts`.
-2. Patch `Arsenal` for abort checks + unit test.
+1. Create `src/scan/{types,profile,abort,autonomous,lane-registry,workflow}.ts`.
+2. Patch `Arsenal` for abort checks + autonomous auto-approve path + unit tests.
 3. Add `/api/scans` CRUD + abort in `server.ts` with origin guard.
-4. Add Vitest coverage for profile hard-fail on missing auth doc.
+4. Add Vitest coverage for placeholder `authorizationDocPath` acceptance and
+   `applyAutonomousFullAuthorization` effects.
 5. Update `FEATURES.md` with “Scan workflow (scaffolding)” experimental row.
 6. No Temporal/Docker yet — in-process only.
 

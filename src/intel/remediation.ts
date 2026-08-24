@@ -56,6 +56,7 @@ export function generateVariants(finding: OriginalFinding): readonly BypassVaria
     case 'ssrf': return ssrfVariants(finding);
     case 'idor': return idorVariants(finding);
     case 'path-traversal': return pathTraversalVariants(finding);
+    default: return [];
   }
 }
 

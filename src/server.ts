@@ -158,6 +158,12 @@ const HOST_IS_LOOPBACK = /^(127\.|localhost$|::1$|\[::1\]$)/i.test(HOST.trim());
 
 const app = express();
 
+// Panel-auth config is needed by the CORS/CSRF middleware below, so it is
+// declared here (the login route + gate further down reuse these consts).
+const PANEL_USER = process.env.T3MP3ST_PANEL_USER || '';
+const PANEL_PASSWORD_SHA256 = (process.env.T3MP3ST_PANEL_PASSWORD_SHA256 || '').toLowerCase();
+const PANEL_AUTH_ENABLED = !!(PANEL_USER && PANEL_PASSWORD_SHA256);
+
 // --- Localhost origin allow-list ------------------------------------------
 // A request from the same-origin UI, curl, or the CLI is trusted; a request
 // carrying an Origin/Referer that points at some OTHER site is a cross-origin
@@ -215,6 +221,10 @@ app.use(cors({
   origin(origin, callback) {
     // No Origin header (curl, CLI, server-to-server) → allow.
     if (!origin) return callback(null, true);
+    // When Bearer-token panel auth is on, reflecting any origin is safe: auth
+    // is not ambient (no cookies), so a foreign page cannot ride the browser's
+    // credentials — it would need the session token, which it doesn't have.
+    if (PANEL_AUTH_ENABLED) return callback(null, true);
     if (isLoopbackOrigin(origin)) return callback(null, true);
     return callback(null, false);
   },
@@ -241,6 +251,10 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   const source = origin ?? referer;
   // No Origin AND no Referer → trusted local caller (curl/CLI/MCP). Allow.
   if (!source) return next();
+  // When panel auth is on, the Bearer-token gate below is the access control;
+  // a foreign webpage cannot forge the Authorization header, so the origin
+  // check would only block the operator's own remote UI. Defer to token auth.
+  if (PANEL_AUTH_ENABLED) return next();
   if (isLoopbackOrigin(source)) return next();
   // #84: on a non-loopback (opted-in network) bind, also trust the operator's own same-origin UI.
   if (!HOST_IS_LOOPBACK && isSameOriginAsHost(source, req.headers.host)) return next();
@@ -287,9 +301,8 @@ app.use(express.json({ limit: '10mb' }));
 // Authorization: Bearer <session-token> header. Tokens are random 32-byte hex,
 // kept in memory with a 12h TTL, and are invalidated on restart. This is the
 // "real auth" the exposure warning above asks for before a non-loopback bind.
-const PANEL_USER = process.env.T3MP3ST_PANEL_USER || '';
-const PANEL_PASSWORD_SHA256 = (process.env.T3MP3ST_PANEL_PASSWORD_SHA256 || '').toLowerCase();
-const PANEL_AUTH_ENABLED = !!(PANEL_USER && PANEL_PASSWORD_SHA256);
+// (PANEL_USER / PANEL_PASSWORD_SHA256 / PANEL_AUTH_ENABLED are declared above,
+// next to `const app`, because the CORS/CSRF middleware consults them.)
 const PANEL_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 const panelTokens = new Map<string, number>(); // token -> expiry epoch ms
 
@@ -4872,7 +4885,9 @@ app.get('/api/events', (_req: Request, res: Response) => {
   // #84: allow the operator's own same-origin UI on a non-loopback (opted-in) bind; foreign
   // origins still fail the loopback check AND the Host match, so they remain rejected.
   const sameOriginNetworkBind = !HOST_IS_LOOPBACK && isSameOriginAsHost(origin, _req.headers.host);
-  if (origin && !isLoopbackOrigin(origin) && !sameOriginNetworkBind) {
+  // PANEL_AUTH_ENABLED: the token gate already vetted this request; the origin
+  // check would only block the operator's own remote dashboard.
+  if (!PANEL_AUTH_ENABLED && origin && !isLoopbackOrigin(origin) && !sameOriginNetworkBind) {
     res.status(403).json({
       error: 'Cross-origin event stream rejected',
       detail: 'The SSE feed may contain live mission/task/finding metadata and is only available to the localhost UI.',

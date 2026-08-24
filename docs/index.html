@@ -3524,6 +3524,10 @@
                 <div class="nav-item active" data-page="warroom">
                     <span class="icon">⚔️</span> War Room
                 </div>
+                <div class="nav-item" data-page="scans">
+                    <span class="icon">🛰️</span> Scans
+                    <span class="badge" id="activeScanCount">0</span>
+                </div>
                 <div class="nav-item" data-page="live-scan">
                     <span class="icon">📡</span> Live Scan
                 </div>
@@ -5654,6 +5658,51 @@
                     </div>
                 </div>
 
+                <!-- Scan Control Plane -->
+                <div class="page" id="page-scans">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:18px;">
+                        <div>
+                            <div style="font-size:10px;color:var(--brand);text-transform:uppercase;letter-spacing:2px;">Shannon Port</div>
+                            <h2 style="margin:4px 0 6px;font-size:24px;">Scan Control Plane</h2>
+                            <p style="color:var(--text-muted);font-size:12px;max-width:720px;line-height:1.6;">Configure the lane pipeline, start an in-process scan, watch PHASE A → B → C → report, or abort every subsequent tool call immediately.</p>
+                        </div>
+                        <button class="btn btn-secondary" onclick="refreshScans()">↻ Refresh</button>
+                    </div>
+
+                    <div class="card" style="margin-bottom:16px;">
+                        <div class="card-header"><h3 class="card-title">New Scan</h3><span class="tag tag-info">Operator controlled</span></div>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;padding-top:10px;">
+                            <div class="form-group">
+                                <label>Profile name</label>
+                                <input class="form-input" id="scanProfileName" value="Panel scan" placeholder="Panel scan">
+                            </div>
+                            <div class="form-group">
+                                <label>Target URL or host</label>
+                                <input class="form-input" id="scanTarget" placeholder="https://authorized.example">
+                            </div>
+                            <div class="form-group">
+                                <label>Authorization document</label>
+                                <input class="form-input" id="scanAuthorizationDoc" value="operator-authorized-target" placeholder="operator-authorized-target">
+                            </div>
+                        </div>
+                        <label style="display:flex;align-items:center;gap:9px;margin:4px 0 14px;font-size:12px;color:var(--text-secondary);cursor:pointer;">
+                            <input type="checkbox" id="scanAutonomous" style="accent-color:var(--brand);width:16px;height:16px;">
+                            Autonomous authorization — auto-pass scope and approval gates for this operator-authorized profile
+                        </label>
+                        <div style="font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">Lanes</div>
+                        <div id="scanLaneGrid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:16px;"></div>
+                        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                            <button class="btn btn-primary" id="scanStartBtn" onclick="startConfiguredScan()">▶ Start Scan</button>
+                            <span id="scanFormStatus" style="font-size:12px;color:var(--text-muted);"></span>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header"><h3 class="card-title">Scan Jobs</h3><span id="scanJobCount" class="tag">0 jobs</span></div>
+                        <div id="scanJobsList" style="padding-top:8px;color:var(--text-muted);font-size:12px;">No scan jobs yet.</div>
+                    </div>
+                </div>
+
                 <!-- Settings -->
                 <div class="page" id="page-settings">
                     <div class="settings-section">
@@ -6382,6 +6431,141 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
         };
 
         // ═══════════════════════════════════════════════════════════════
+        // SCAN CONTROL PLANE
+        // ═══════════════════════════════════════════════════════════════
+        const SCAN_LANES = [
+            ['recon', 'Recon', true],
+            ['tier_e', 'Tier-E white-box', false],
+            ['browser_dast', 'Browser DAST', false],
+            ['authz_matrix', 'Authz matrix', false],
+            ['flow_attacks', 'Flow attacks', false],
+            ['credential', 'Credential lane', false],
+            ['sol_audit', 'Solidity audit', false],
+            ['chain_sim', 'Chain simulation', false],
+            ['greybox_fuzz', 'Greybox fuzz', false],
+            ['api_fuzz', 'API fuzz', false],
+            ['protocol_tests', 'Protocol tests', false],
+            ['report', 'Report', true],
+            ['integrations', 'Integrations', false],
+        ];
+
+        function initScanControls() {
+            const grid = document.getElementById('scanLaneGrid');
+            if (!grid || grid.dataset.ready) return;
+            grid.dataset.ready = '1';
+            grid.innerHTML = SCAN_LANES.map(function(lane) {
+                return '<label style="display:flex;align-items:center;gap:8px;padding:9px 10px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:7px;font-size:11px;color:var(--text-secondary);cursor:pointer;">'
+                    + '<input class="scan-lane-toggle" type="checkbox" value="' + lane[0] + '" ' + (lane[2] ? 'checked' : '') + ' style="accent-color:var(--brand);">'
+                    + '<span>' + lane[1] + '</span></label>';
+            }).join('');
+        }
+
+        function scanStatusColor(status) {
+            return status === 'running' ? '#2fd6ff' : status === 'completed' ? '#00ff88' : status === 'aborted' ? '#ffaa00' : status === 'failed' ? '#ff5555' : '#9baeb8';
+        }
+
+        function escapeScan(value) {
+            const node = document.createElement('span');
+            node.textContent = String(value == null ? '' : value);
+            return node.innerHTML;
+        }
+
+        function renderScans(scans) {
+            initScanControls();
+            const list = document.getElementById('scanJobsList');
+            const count = document.getElementById('scanJobCount');
+            const badge = document.getElementById('activeScanCount');
+            if (count) count.textContent = scans.length + (scans.length === 1 ? ' job' : ' jobs');
+            const active = scans.filter(function(job) { return job.status === 'running' || job.status === 'queued'; }).length;
+            if (badge) badge.textContent = String(active);
+            if (!list) return;
+            if (!scans.length) {
+                list.innerHTML = '<div style="padding:18px;color:var(--text-muted);">No scan jobs yet.</div>';
+                return;
+            }
+            list.innerHTML = scans.map(function(job) {
+                const laneRows = Object.entries(job.lanes || {}).map(function(entry) {
+                    return '<span style="padding:3px 7px;border:1px solid var(--border-color);border-radius:999px;color:var(--text-muted);font-size:9px;">' + escapeScan(entry[0]) + ': ' + escapeScan(entry[1].status) + '</span>';
+                }).join('');
+                const targets = [].concat(job.profile?.target?.urls || [], job.profile?.target?.hosts || []).join(', ') || '—';
+                const abort = job.status === 'running' ? '<button class="btn btn-danger btn-sm" onclick="abortScanJob(\'' + escapeScan(job.id) + '\')">Abort</button>' : '';
+                return '<div style="padding:13px 4px;border-bottom:1px solid var(--border-color);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;">'
+                    + '<div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><strong style="color:var(--text-primary);">' + escapeScan(job.name || job.id) + '</strong>'
+                    + '<span style="font-size:10px;text-transform:uppercase;color:' + scanStatusColor(job.status) + ';">' + escapeScan(job.status) + '</span>'
+                    + (job.profile?.autonomous ? '<span style="font-size:9px;color:#ffaa00;border:1px solid rgba(255,170,0,.35);border-radius:999px;padding:2px 6px;">AUTONOMOUS</span>' : '')
+                    + '</div><div style="color:var(--text-muted);font-size:10px;margin-top:5px;overflow-wrap:anywhere;">' + escapeScan(targets) + ' · phase ' + escapeScan(job.phase) + ' · ' + escapeScan(job.findings?.length || 0) + ' findings</div>'
+                    + '<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;">' + laneRows + '</div></div>' + abort + '</div>';
+            }).join('');
+        }
+
+        async function refreshScans() {
+            initScanControls();
+            const data = await T3MP3ST_API.get('/api/scans');
+            const scans = Array.isArray(data?.scans) ? data.scans : [];
+            renderScans(scans);
+            return scans;
+        }
+        window.refreshScans = refreshScans;
+
+        async function startConfiguredScan() {
+            initScanControls();
+            const status = document.getElementById('scanFormStatus');
+            const button = document.getElementById('scanStartBtn');
+            const target = document.getElementById('scanTarget').value.trim();
+            if (!target) {
+                status.textContent = 'Enter an authorized target URL or host.';
+                status.style.color = '#ff6666';
+                return;
+            }
+            const lanes = {};
+            document.querySelectorAll('.scan-lane-toggle').forEach(function(el) {
+                lanes[el.value] = { enabled: el.checked };
+            });
+            let isUrl = false;
+            try { const parsed = new URL(target); isUrl = parsed.protocol === 'http:' || parsed.protocol === 'https:'; } catch {}
+            const autonomous = document.getElementById('scanAutonomous').checked;
+            const profile = {
+                name: document.getElementById('scanProfileName').value.trim() || 'Panel scan',
+                target: { urls: isUrl ? [target] : [], hosts: isUrl ? [] : [target] },
+                authorizationDocPath: document.getElementById('scanAuthorizationDoc').value.trim() || (autonomous ? 'operator-authorized-target' : undefined),
+                autonomous: autonomous,
+                lanes: lanes,
+            };
+            button.disabled = true;
+            status.style.color = 'var(--text-muted)';
+            status.textContent = 'Starting…';
+            const result = await T3MP3ST_API.post('/api/scans', profile);
+            button.disabled = false;
+            if (!result?.success) {
+                status.style.color = '#ff6666';
+                status.textContent = result?.errors?.join('; ') || result?.error || 'Scan could not start';
+                return;
+            }
+            status.style.color = '#00ff88';
+            status.textContent = 'Started ' + result.job.id;
+            await refreshScans();
+        }
+        window.startConfiguredScan = startConfiguredScan;
+
+        async function abortScanJob(id) {
+            const result = await T3MP3ST_API.post('/api/scans/' + encodeURIComponent(id) + '/abort', { reason: 'operator panel' });
+            const status = document.getElementById('scanFormStatus');
+            if (status) {
+                status.style.color = result?.success ? '#ffaa00' : '#ff6666';
+                status.textContent = result?.success ? 'Abort requested for ' + id : (result?.error || 'Abort failed');
+            }
+            await refreshScans();
+        }
+        window.abortScanJob = abortScanJob;
+
+        document.addEventListener('DOMContentLoaded', function() {
+            initScanControls();
+            setInterval(function() {
+                if (document.getElementById('page-scans')?.classList.contains('active')) refreshScans();
+            }, 2500);
+        });
+
+        // ═══════════════════════════════════════════════════════════════
         // BACKEND DISPATCH — Real operator execution via server API
         // ═══════════════════════════════════════════════════════════════
         const BackendDispatch = {
@@ -6407,7 +6591,9 @@ tempest.operators.<span class="function">spawn</span>(<span class="string">'scan
                 if (!T3MP3ST_API.baseUrl) return;
 
                 try {
-                    this._eventSource = new EventSource(`${T3MP3ST_API.baseUrl}/api/events`);
+                    const eventUrl = new URL(`${T3MP3ST_API.baseUrl}/api/events`);
+                    if (PANEL_AUTH.token) eventUrl.searchParams.set('token', PANEL_AUTH.token);
+                    this._eventSource = new EventSource(eventUrl.toString());
 
                     this._eventSource.addEventListener('connected', () => {
                         console.log('[BackendDispatch] SSE connected');
@@ -7786,9 +7972,10 @@ Correlating findings across agents, identifying patterns, producing actionable i
         function navigateTo(page) {
             document.querySelectorAll('.nav-item').forEach(i => i.classList.toggle('active', i.dataset.page === page));
             document.querySelectorAll('.page').forEach(p => p.classList.toggle('active', p.id === `page-${page}`));
-            const titles = { warroom: 'War Room', 'live-scan': 'Live Scan', receipts: 'Scope Receipts', operators: 'Operatives', evidence: 'Evidence Vault', arsenal: 'Arsenal', terminal: 'Terminal', benchmarks: 'Benchmarks', configs: 'Config Library', 'ctf-range': 'CTF Range', general: 'Op Admiral', selfimprove: 'Self-Improvement', settings: 'Settings', about: 'About' };
+            const titles = { warroom: 'War Room', scans: 'Scans', 'live-scan': 'Live Scan', receipts: 'Scope Receipts', operators: 'Operatives', evidence: 'Evidence Vault', arsenal: 'Arsenal', terminal: 'Terminal', benchmarks: 'Benchmarks', configs: 'Config Library', 'ctf-range': 'CTF Range', general: 'Op Admiral', selfimprove: 'Self-Improvement', settings: 'Settings', about: 'About' };
             document.getElementById('pageTitle').textContent = titles[page] || 'War Room';
             document.getElementById('sidebar').classList.remove('open');
+            if (page === 'scans') setTimeout(() => window.refreshScans?.(), 50);
             if (page === 'live-scan') setTimeout(() => window.refreshLiveScanPage?.(), 50);
             if (page === 'receipts') setTimeout(() => window.refreshReceiptsPage?.(), 50);
             if (page === 'operators' && typeof window.loadOperativesRoster === 'function') setTimeout(window.loadOperativesRoster, 80);

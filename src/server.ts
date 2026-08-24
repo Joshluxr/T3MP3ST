@@ -34,7 +34,11 @@ import type { OperatorArchetype, LLMProvider } from './types/index.js';
 import { listOperatorPrompts, setOperatorOverride, resetOperatorOverride, type OperatorOverride } from './operators/index.js';
 import { ingestRepoToSourceContext, runWhiteboxAnalysis, resolveRepoSourceForAnalysis, RepoCloneError, RepoPathError } from './recon/whitebox.js';
 import { initGrammars } from './recon/ts-grammars.js';
-import { redactCredential } from './evidence/index.js';
+import { redactCredential, EvidenceVault } from './evidence/index.js';
+import { Arsenal, BUILTIN_TOOLS, EXTERNAL_TOOLS, hostFromTargetValue } from './arsenal/index.js';
+import { ScanWorkflow, createDefaultLaneRegistry, validateScanProfile } from './scan/index.js';
+import type { ScanProgressEvent } from './scan/index.js';
+import { ApprovalController } from './arsenal/approval.js';
 import type { ArsenalScope } from './arsenal/index.js';
 import {
   parseEngagementYaml, scopeFromEngagement, describeScope, YamlParseError, EngagementValidationError,
@@ -364,7 +368,9 @@ if (PANEL_AUTH_ENABLED) {
     // unauthenticated; the API behind it stays token-gated.
     if (AUTH_EXEMPT.has(req.path) || req.path === '/ui' || req.path.startsWith('/ui/')) return next();
     const header = req.get('authorization') || '';
-    const token = header.startsWith('Bearer ') ? header.slice(7) : req.get('x-panel-token');
+    const bearer = header.startsWith('Bearer ') ? header.slice(7) : undefined;
+    const queryToken = req.path === '/api/events' && typeof req.query.token === 'string' ? req.query.token : undefined;
+    const token = bearer || req.get('x-panel-token') || queryToken;
     if (isValidPanelToken(token)) return next();
     res.status(401).json({ error: 'Authentication required', detail: 'POST /api/panel/login with {"username","password"} to obtain a Bearer token.' });
   });
@@ -8475,6 +8481,81 @@ app.post('/api/intel/flow/:lane', async (req: Request, res: Response) => {
   void appendStateEvent('intel.flow.completed', { lane, findings: findings.length, blocked: blocked.length });
   schedulePersist('intel.flow');
   res.json({ lane, findings, storedIds: stored.map(r => r.id), blocked, scope: describeScope(scope) });
+});
+
+// =============================================================================
+// SCAN CONTROL PLANE
+// =============================================================================
+
+const scanArsenal = new Arsenal();
+scanArsenal.registerMany(BUILTIN_TOOLS);
+scanArsenal.registerMany(EXTERNAL_TOOLS);
+scanArsenal.setApprovalController(new ApprovalController({
+  preApprovedTools: (process.env.T3MP3ST_APPROVED_TOOLS ?? '').split(',').map((s) => s.trim()).filter(Boolean),
+  onDecision: (record) => broadcastEvent('arsenal.approval', record as unknown as Record<string, unknown>),
+  onWarning: (request) => broadcastEvent('arsenal.warning', request as unknown as Record<string, unknown>),
+}));
+const scanVault = new EvidenceVault();
+const scanWorkflow = new ScanWorkflow({
+  arsenal: scanArsenal,
+  vault: scanVault,
+  registry: createDefaultLaneRegistry(),
+  reportsDir: process.env.T3MP3ST_SCAN_REPORTS_DIR || join(process.cwd(), 'reports', 'scans'),
+});
+
+scanWorkflow.on('event', (event: ScanProgressEvent) => {
+  broadcastEvent(event.type, event as unknown as Record<string, unknown>);
+});
+
+app.post('/api/scans', (req: Request, res: Response): void => {
+  const validation = validateScanProfile(req.body);
+  if (!validation.ok || !validation.profile) {
+    res.status(400).json({ success: false, error: 'Invalid scan profile', errors: validation.errors });
+    return;
+  }
+  try {
+    const profile = validation.profile;
+    const scopeHosts = [...profile.target.urls, ...profile.target.hosts]
+      .map((target) => hostFromTargetValue(target))
+      .filter((host): host is string => Boolean(host));
+    scanArsenal.setScope({
+      allowedHosts: [...new Set(scopeHosts)],
+      allowLoopback: scopeHosts.some((host) => host === 'localhost' || host === '::1' || host.startsWith('127.')),
+      allowPrivate: false,
+    });
+    const job = scanWorkflow.start(profile);
+    res.status(202).json({ success: true, job });
+  } catch (error) {
+    res.status(409).json({ success: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.get('/api/scans', (_req: Request, res: Response): void => {
+  res.json({ scans: scanWorkflow.listJobs() });
+});
+
+app.get('/api/scans/:id', (req: Request, res: Response): void => {
+  const job = scanWorkflow.getJob(req.params.id);
+  if (!job) {
+    res.status(404).json({ error: 'Scan not found' });
+    return;
+  }
+  res.json(job);
+});
+
+app.post('/api/scans/:id/abort', (req: Request, res: Response): void => {
+  const reason = typeof req.body?.reason === 'string' && req.body.reason.trim()
+    ? req.body.reason.trim().slice(0, 200)
+    : 'operator';
+  if (!scanWorkflow.getJob(req.params.id)) {
+    res.status(404).json({ error: 'Scan not found' });
+    return;
+  }
+  if (!scanWorkflow.abortJob(req.params.id, reason)) {
+    res.status(409).json({ error: 'Scan is not running' });
+    return;
+  }
+  res.status(202).json({ success: true, id: req.params.id, reason });
 });
 
 // =============================================================================

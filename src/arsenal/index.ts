@@ -15,6 +15,7 @@ import * as net from 'net';
 import * as dns from 'dns';
 import * as tls from 'tls';
 import { ApprovalController, isGatedRisk, type ApprovalRequest } from './approval.js';
+import type { ScanAbortController } from '../scan/types.js';
 import { classifySubdomainTakeover, renderTakeoverReport } from './takeover.js';
 
 const execFileAsync = promisify(execFile);
@@ -185,6 +186,7 @@ export interface ArsenalEvents {
   'tool:registered': CustomTool;
   'tool:executed': { tool: CustomTool; result: ToolResult; durationMs: number };
   'tool:error': { tool: CustomTool; error: Error };
+  'tool:autonomous-bypass': { tool: CustomTool; gate: string; detail: string };
 }
 
 export interface ToolExecution {
@@ -323,6 +325,10 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
   private scope: ArsenalScope | null = null;
   /** Capability approval gate; null = gating off (backward-compat). The engine wires one for live runs. */
   private approval: ApprovalController | null = null;
+  /** Scan abort signal; null = no scan-level abort wired (backward-compat). */
+  private abort: ScanAbortController | null = null;
+  /** Shannon-style autonomous unlock: scope + approval checks auto-pass. Default off. */
+  private autonomous: boolean = false;
   private executions: ToolExecution[] = [];
 
   /**
@@ -372,6 +378,15 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
   setApprovalController(approval: ApprovalController | null): void { this.approval = approval; }
   getApprovalController(): ApprovalController | null { return this.approval; }
 
+  /** Wire (or clear) the scan abort controller; execute() throws once the scan is aborted. */
+  setAbortController(abort: ScanAbortController | null): void { this.abort = abort; }
+  getAbortController(): ScanAbortController | null { return this.abort; }
+
+  /** Shannon applyAutonomousFullAuthorization-style unlock: when on, the egress scope gate and the
+   *  approval gate auto-pass every call (each auto-pass is still audited with the autonomous marker). */
+  setAutonomous(autonomous: boolean): void { this.autonomous = autonomous; }
+  isAutonomous(): boolean { return this.autonomous; }
+
   /**
    * Execute a tool
    */
@@ -379,6 +394,10 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
     toolName: string,
     context: ToolContext
   ): Promise<ToolResult> {
+    // Scan abort gate: a cancelled scan stops ALL further tool execution, before any registry
+    // lookup, scope check, approval prompt, or handler run.
+    this.abort?.throwIfAborted();
+
     const tool = this.tools.get(toolName);
     if (!tool) {
       const err = new ToolError(
@@ -392,8 +411,13 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
 
     // Egress scope gate: deny out-of-scope network targets BEFORE the handler runs. A tool call
     // never reaches a host outside the authorized scope, regardless of what the model supplied.
+    // Under the autonomous unlock the gate auto-passes (Shannon behavior) but is still evaluated
+    // so the audit trail can record what WOULD have been denied.
     const blockedHost = scopeViolation(this.scope, context);
-    if (blockedHost) {
+    if (blockedHost && this.autonomous) {
+      this.emit('tool:autonomous-bypass', { tool, gate: 'scope', detail: `out-of-scope target '${blockedHost}' auto-passed (autonomous)` });
+    }
+    if (blockedHost && !this.autonomous) {
       const denied: ToolResult = {
         success: false,
         error: `SCOPE DENIED: target '${blockedHost}' is not in the authorized scope — ${toolName} refused before execution. Only authorized / loopback / lab targets are permitted.`,
@@ -406,6 +430,10 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
     // until it has been approved (interactively "approve once, then free", or via the headless
     // pre-authorization allowlist); the hottest actions also fire a loud, audited, non-blocking
     // warning. Safe/active tools pass straight through. No controller wired = gating off (backward-compat).
+    // Autonomous unlock: auto-approve gated tiers up front so the gate below passes immediately.
+    if (this.autonomous && this.approval && isGatedRisk(tool.riskTier)) {
+      this.approval.approveTool(toolName);
+    }
     if (this.approval && isGatedRisk(tool.riskTier)) {
       const request: ApprovalRequest = {
         tool: toolName,
@@ -448,6 +476,7 @@ export class Arsenal extends EventEmitter<ArsenalEvents> {
 
     try {
       const result = redactConfiguredSecrets(await tool.handler(context));
+      this.abort?.throwIfAborted();
       const durationMs = Date.now() - startTime;
 
       execution.completedAt = Date.now();

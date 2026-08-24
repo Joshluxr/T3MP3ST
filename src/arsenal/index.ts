@@ -247,6 +247,15 @@ function privateBlockMinMask(h: string): number {
   return 8; // 10/8, 127/8, and (conservatively) IPv6 ULA
 }
 
+/** Is this single host admitted by the scope (allowlist / loopback / private)? Shared by the
+ *  arsenal execute() gate and the intel lanes' scoped probe. */
+export function hostAllowed(scope: ArsenalScope, host: string): boolean {
+  const h = host.toLowerCase();
+  if (scope.allowLoopback && isLoopbackTargetHost(h)) return true;
+  if (scope.allowPrivate && isPrivateTargetHost(h)) return true;
+  return scope.allowedHosts.some(a => a.toLowerCase() === h || h.endsWith('.' + a.toLowerCase()));
+}
+
 /** null = in scope (or no host to check); otherwise the out-of-scope host/range that must be blocked. */
 export function scopeViolation(scope: ArsenalScope | null, context: ToolContext): string | null {
   if (!scope) return null; // enforcement off until configured
@@ -268,7 +277,6 @@ export function scopeViolation(scope: ArsenalScope | null, context: ToolContext)
     }
     candidates.push({ h, v });
   }
-  const allow = scope.allowedHosts.map(a => a.toLowerCase());
   for (const { h, v } of candidates) {
     // How is the BASE host admitted — and what CIDR prefix keeps the WHOLE range inside that block?
     // hostFromTargetValue strips the mask, so "10.0.0.0/0" (base 10.0.0.0 private) would otherwise
@@ -277,7 +285,7 @@ export function scopeViolation(scope: ArsenalScope | null, context: ToolContext)
     let minMask: number;
     if (scope.allowLoopback && isLoopbackTargetHost(h)) minMask = 8;              // 127/8, ::1
     else if (scope.allowPrivate && isPrivateTargetHost(h)) minMask = privateBlockMinMask(h);
-    else if (allow.some(a => a === h || h.endsWith('.' + a))) minMask = 32;        // exact-allowed host → only /32
+    else if (hostAllowed(scope, h)) minMask = 32;                                  // exact-allowed host → only /32
     else return h; // base host out of scope
     // treat a trailing "/N" as a CIDR mask ONLY on a bare host/ip (no scheme) — not a URL path segment.
     const cidr = !v.includes('://') && v.match(/^[^/]+\/(\d{1,3})$/);

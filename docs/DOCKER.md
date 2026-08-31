@@ -184,7 +184,7 @@ The Docker setup binds the server to `0.0.0.0` inside the container to allow por
 
 **SAFE:** The default `docker-compose.yml` publishes the port as `127.0.0.1:3333:3333`, which restricts access to localhost only.
 
-**UNSAFE:** Running `docker run -p 3333:3333` (without the `127.0.0.1:` prefix) or `network_mode: host` exposes the **unauthenticated command-executing API** on all network interfaces (0.0.0.0), allowing anyone on your network (or the internet if port-forwarded) to execute arbitrary system commands.
+**UNSAFE:** Running `docker run -p 3333:3333` (without the `127.0.0.1:` prefix) or `network_mode: host` exposes the **command-executing API** on all network interfaces (0.0.0.0), allowing anyone on your network (or the internet if port-forwarded) to reach it. The in-container `0.0.0.0` bind comes from `DOCKER=true`, not an explicit `T3MP3ST_HOST`, so Bearer auth is not enforced automatically in this mode — if you publish beyond loopback, set `T3MP3ST_HOST=0.0.0.0` **and** `T3MP3ST_TOKEN=<strong secret>` explicitly (the server then refuses to start without the token and requires `Authorization: Bearer <token>` on every `/api` route), or terminate TLS + auth at a reverse proxy.
 
 **Deployment Rules:**
 - ✅ Always bind to `127.0.0.1` on the host: `-p 127.0.0.1:3333:3333`

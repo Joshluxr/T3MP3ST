@@ -52,8 +52,9 @@ degrade gracefully — they never fail the core run.
 - **Never run live scans or exploitation against a target without an explicit authorization /
   scope receipt.** The default posture is owned / local / synthetic targets only.
 - The server binds `127.0.0.1` by default. If you set `T3MP3ST_HOST` to a non-loopback address,
-  it prints an **EXPOSURE WARNING** — the API executes commands and has **no built-in auth**. Put
-  a Bearer-token reverse proxy in front of it before any LAN / internet exposure.
+  you **must** set `T3MP3ST_TOKEN` — the server refuses to start without it and then enforces
+  `Authorization: Bearer <token>` on every `/api` route. Still prefer TLS in front of the
+  plain-HTTP listener for any LAN / internet exposure.
 
 ## 6. Publish
 
